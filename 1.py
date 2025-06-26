@@ -161,5 +161,39 @@ with DAG(
 
 log_start >> run_sqlserver_to_gcs >> check_sqlserver_job_status >> wait_for_file >> run_gcs_parquet_to_bq >> check_bq_job_status >> create_iceberg_table >> insert_iceberg_table >> log_success
 
+from airflow import DAG
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from datetime import datetime
+
+with DAG(
+    dag_id="dag_master_parallel_launcher",
+    start_date=datetime(2025, 6, 1),
+    schedule_interval=None,
+    catchup=False,
+    tags=["launcher", "parallel"]
+) as dag:
+
+    launch_config1 = TriggerDagRunOperator(
+        task_id="launch_config1",
+        trigger_dag_id="dag_sqlserver_to_gcs_to_bq_to_iceberg_yaml_log",
+        conf={"config_file": "config1.yaml"},
+        wait_for_completion=False
+    )
+
+    launch_config2 = TriggerDagRunOperator(
+        task_id="launch_config2",
+        trigger_dag_id="dag_sqlserver_to_gcs_to_bq_to_iceberg_yaml_log",
+        conf={"config_file": "config2.yaml"},
+        wait_for_completion=False
+    )
+
+    launch_config3 = TriggerDagRunOperator(
+        task_id="launch_config3",
+        trigger_dag_id="dag_sqlserver_to_gcs_to_bq_to_iceberg_yaml_log",
+        conf={"config_file": "config3.yaml"},
+        wait_for_completion=False
+    )
+
+    [launch_config1, launch_config2, launch_config3]
 
  
