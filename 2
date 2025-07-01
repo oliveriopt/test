@@ -48,3 +48,19 @@ with DAG(
         python_callable=print_config,
         provide_context=True
     )
+
+
+pipeline_name: "dummy_pipeline_1"
+source:
+  type: "sqlserver"
+  database: "db_sales"
+  table: "orders"
+  query: "SELECT * FROM orders WHERE order_date >= '2024-01-01'"
+destination:
+  type: "bigquery"
+  dataset: "sales_analytics"
+  table: "orders_clean"
+options:
+  trigger_type: "manual"
+  write_disposition: "WRITE_APPEND"
+  notify_email: "data-team@example.com"
