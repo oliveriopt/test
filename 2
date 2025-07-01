@@ -1,0 +1,50 @@
+from airflow import DAG
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from datetime import datetime
+
+# Simula 3 YAMLs distintos
+config_files = [
+    "dummy_config1.yaml",
+    "dummy_config2.yaml",
+    "dummy_config3.yaml"
+]
+
+with DAG(
+    dag_id="dag_master_launcher_dummy",
+    start_date=datetime(2025, 6, 1),
+    schedule_interval=None,
+    catchup=False,
+    tags=["launcher", "dummy"]
+) as dag:
+
+    for idx, config_file in enumerate(config_files):
+        TriggerDagRunOperator(
+            task_id=f"launch_dummy_{idx}",
+            trigger_dag_id="dag_dummy_worker",
+            conf={"config_file": config_file},
+            wait_for_completion=False
+        )
+
+
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+def print_config(**context):
+    config_file = context["dag_run"].conf.get("config_file", "NO CONFIG RECEIVED")
+    print(f"Running DAG with config: {config_file}")
+
+with DAG(
+    dag_id="dag_dummy_worker",
+    start_date=datetime(2025, 6, 1),
+    schedule_interval=None,
+    catchup=False,
+    tags=["dummy", "worker"]
+) as dag:
+
+    task = PythonOperator(
+        task_id="print_config_file",
+        python_callable=print_config,
+        provide_context=True
+    )
