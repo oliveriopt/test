@@ -199,3 +199,68 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     run_pipeline()
 
+
+
+Oliver
+Started building schema config structure using INFORMATION_SCHEMA.COLUMNS 
+Connected to SQL Server (non-prod) for metadata extraction
+Created YAML config prototype
+Alex
+Reviewed Flex Template structure and existing YAML injection points
+Identified hardcoded SQL in the pipeline and initiated refactor
+Listed all  tables split between us for extraction from metadata and validated extract conditions
+Fuad
+Identified some tables for extraction after splitting work up with Alex and Oliver
+Set up GCS folder structures for table-wise ingestion output
+Drafted CDC-based ingestion logic for these tables
+🟨 Day 2 (Tuesday)
+Oliver
+Expanded YAML config with table types, PKs, load types
+Stored metadata snapshot in BigQuery for audit
+Extracted PK info using INFORMATION_SCHEMA.TABLE_CONSTRAINTS and KEY_COLUMN_USAGE
+Alex
+Refactored Flex Template to generate dynamic SQL from YAML
+Added error logging for missing placeholders
+Initiated test run for orders_core and orders_header tables or any 2 tables of choice
+Fuad
+Verified parallel ingestion logic on tables.
+Created dynamic path generation in GCS per table
+Synced with Alex on shared ingestion utility code
+🟧 Day 3 (Wednesday)
+Oliver
+Finalized config generation script and pushed to GCS
+Configured Composer DAG to dynamically load this config
+Successfully extracted metadata from 2 test tables
+Alex
+Completed ingestion for <some no. of tables> tables
+Added row count checks and log writebacks to BigQuery
+Completed dynamic SQL generation for partitioned tables
+Fuad
+Ingested 80% of remaining tables using Flex Template
+Logged table execution results to BigQuery
+Began work on MERGE logic for Change Tracking to Iceberg
+🟨 Day 4 (Thursday)
+Oliver
+Composer reads config and creates task group dynamically
+If yes then maybe it can be moved to Code Review
+Alex
+Validated ingestion across all orders_* tables
+Created partitioned Iceberg tables in BigQuery
+Began documenting SQL logic translation workflow
+Fuad
+Created MERGE logic that applies I/U/D flags from change tracking
+Tested against sample data in BigLake Iceberg table
+Integrated merge step post-ingestion in Composer DAG
+🟩 Day 5 (Friday)
+Oliver
+Final cleanup and validation of config and metadata scripts
+Code review comments addressed
+Stories marked as Done
+Alex
+All orders tables are successfully ingested
+Test on possibly different data ingestion scenarios
+Flex Template logic modularized
+Fuad
+Completed ingestion of all non-orders tables
+Merge logic pushed to DAG and tested with 2 CDC-enabled tables
+Validated deletes and updates 
