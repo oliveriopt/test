@@ -1,66 +1,201 @@
-from airflow import DAG
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+Build and schedule a daily job to extract metadata from SQL Server's INFORMATION_SCHEMA and primary key constraints. This metadata will be used to drive orchestration and schema creation in downstream processes.
+
+Acceptance Criteria
+
+Extract table name, column list, data types, primary keys
+
+Store output as Parquet in GCS and also ingest into BigQuery for analytics
+
+Ensure idempotent execution and overwrite safety
+
+Schedule job via Composer to run daily at 6 AM
+
+
+
+    SELECT cast([TABLE_CATALOG] as varchar(max)) as table_catalog,
+           cast([TABLE_SCHEMA] as varchar(max)) as table_schema,
+           cast([TABLE_NAME] as varchar(max)) as table_name,
+           cast([COLUMN_NAME] as varchar(max)) as column_name,
+           cast([ORDINAL_POSITION] as varchar(max)) as ordinal_position,
+           cast([COLUMN_DEFAULT] as varchar(max)) as column_default,
+           cast([IS_NULLABLE] as varchar(max)) as is_nullable,
+           cast([DATA_TYPE] as varchar(max)) as data_type,
+           cast([CHARACTER_MAXIMUM_LENGTH] as varchar(max)) as character_maximum_length,
+           cast([CHARACTER_OCTET_LENGTH] as varchar(max)) as character_octet_length,
+           cast([NUMERIC_PRECISION] as varchar(max)) as numeric_precision,
+           cast([NUMERIC_PRECISION_RADIX] as varchar(max)) as numeric_precision_radix,
+           cast([NUMERIC_SCALE] as varchar(max)) as numeric_scale,
+           cast([DATETIME_PRECISION] as varchar(max)) as datetime_precision,
+           cast([CHARACTER_SET_CATALOG] as varchar(max)) as character_set_catalog,
+           cast([CHARACTER_SET_SCHEMA] as varchar(max)) as character_set_schema,
+           cast([CHARACTER_SET_NAME] as varchar(max)) as character_set_name,
+           cast([COLLATION_CATALOG] as varchar(max)) as collation_catalog,
+           cast([COLLATION_SCHEMA] as varchar(max)) as collation_schema,
+           cast([COLLATION_NAME] as varchar(max)) as collation_name,
+           cast([DOMAIN_CATALOG] as varchar(max)) as domain_catalog,
+           cast([DOMAIN_SCHEMA] as varchar(max)) as domain_schema,
+           cast([DOMAIN_NAME] as varchar(max)) as domain_name
+    FROM [XpoMaster].[INFORMATION_SCHEMA].[COLUMNS]
+
+    SELECT 
+    t.TABLE_CATALOG,
+    t.TABLE_SCHEMA,
+    t.TABLE_NAME,
+    kcu.COLUMN_NAME,
+    kcu.ORDINAL_POSITION
+FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t
+JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS kcu
+    ON t.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+    AND t.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+WHERE t.CONSTRAINT_TYPE = 'PRIMARY KEY'
+ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME, kcu.ORDINAL_POSITION;
+
+
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions
+import pyodbc
 from datetime import datetime
+import pyarrow as pa
+import pyarrow.parquet as pq
+import gcsfs
+import json
+import logging
+import os
+import uuid
 
-# Simula 3 YAMLs distintos
-config_files = [
-    "dummy_config1.yaml",
-    "dummy_config2.yaml",
-    "dummy_config3.yaml"
-]
-
-with DAG(
-    dag_id="dag_master_launcher_dummy",
-    start_date=datetime(2025, 6, 1),
-    schedule_interval=None,
-    catchup=False,
-    tags=["launcher", "dummy"]
-) as dag:
-
-    for idx, config_file in enumerate(config_files):
-        TriggerDagRunOperator(
-            task_id=f"launch_dummy_{idx}",
-            trigger_dag_id="dag_dummy_worker",
-            conf={"config_file": config_file},
-            wait_for_completion=False
-        )
+from google.cloud import secretmanager
 
 
+def get_sql_config(secret_id, project_id):
+    logging.info(f"Accessing secret '{secret_id}' from default project context")
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+    response = client.access_secret_version(request={"name": name})
+    secret_payload = response.payload.data.decode("UTF-8")
+    logging.info("Secret retrieved successfully.")
+    return json.loads(secret_payload)
 
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from datetime import datetime
 
-def print_config(**context):
-    config_file = context["dag_run"].conf.get("config_file", "NO CONFIG RECEIVED")
-    print(f"Running DAG with config: {config_file}")
-
-with DAG(
-    dag_id="dag_dummy_worker",
-    start_date=datetime(2025, 6, 1),
-    schedule_interval=None,
-    catchup=False,
-    tags=["dummy", "worker"]
-) as dag:
-
-    task = PythonOperator(
-        task_id="print_config_file",
-        python_callable=print_config,
-        provide_context=True
+def build_connection_string(config):
+    logging.info("Building SQL Server connection string...")
+    return (
+        f"DRIVER={{{config['driver']}}};"
+        f"SERVER={config['server']},1433;"
+        f"DATABASE={config['database']};"
+        f"UID={config['username']};"
+        f"PWD={config['password']};"
+        f"Encrypt=yes;"
+        f"TrustServerCertificate=yes;"
     )
 
 
-pipeline_name: "dummy_pipeline_1"
-source:
-  type: "sqlserver"
-  database: "db_sales"
-  table: "orders"
-  query: "SELECT * FROM orders WHERE order_date >= '2024-01-01'"
-destination:
-  type: "bigquery"
-  dataset: "sales_analytics"
-  table: "orders_clean"
-options:
-  trigger_type: "manual"
-  write_disposition: "WRITE_APPEND"
-  notify_email: "data-team@example.com"
+class CustomPipelineOptions(PipelineOptions):
+    @classmethod
+    def _add_argparse_args(cls, parser):
+        parser.add_argument('--gcp_project', required=True)
+        parser.add_argument('--output_path', required=True)
+        parser.add_argument('--secret_id', required=True)
+
+
+class ReadFullTable(beam.DoFn):
+    def __init__(self, connection_string):
+        self.connection_string = connection_string
+        self.conn = None
+
+    def start_bundle(self):
+        self.conn = pyodbc.connect(self.connection_string)
+
+    def process(self, element):
+        cursor = self.conn.cursor()
+        query = f"""
+        SELECT cast([TABLE_CATALOG] as varchar(max)) as table_catalog,
+               cast([TABLE_SCHEMA] as varchar(max)) as table_schema,
+               cast([TABLE_NAME] as varchar(max)) as table_name,
+               cast([COLUMN_NAME] as varchar(max)) as column_name,
+               cast([ORDINAL_POSITION] as varchar(max)) as ordinal_position,
+               cast([COLUMN_DEFAULT] as varchar(max)) as column_default,
+               cast([IS_NULLABLE] as varchar(max)) as is_nullable,
+               cast([DATA_TYPE] as varchar(max)) as data_type,
+               cast([CHARACTER_MAXIMUM_LENGTH] as varchar(max)) as character_maximum_length,
+               cast([CHARACTER_OCTET_LENGTH] as varchar(max)) as character_octet_length,
+               cast([NUMERIC_PRECISION] as varchar(max)) as numeric_precision,
+               cast([NUMERIC_PRECISION_RADIX] as varchar(max)) as numeric_precision_radix,
+               cast([NUMERIC_SCALE] as varchar(max)) as numeric_scale,
+               cast([DATETIME_PRECISION] as varchar(max)) as datetime_precision,
+               cast([CHARACTER_SET_CATALOG] as varchar(max)) as character_set_catalog,
+               cast([CHARACTER_SET_SCHEMA] as varchar(max)) as character_set_schema,
+               cast([CHARACTER_SET_NAME] as varchar(max)) as character_set_name,
+               cast([COLLATION_CATALOG] as varchar(max)) as collation_catalog,
+               cast([COLLATION_SCHEMA] as varchar(max)) as collation_schema,
+               cast([COLLATION_NAME] as varchar(max)) as collation_name,
+               cast([DOMAIN_CATALOG] as varchar(max)) as domain_catalog,
+               cast([DOMAIN_SCHEMA] as varchar(max)) as domain_schema,
+               cast([DOMAIN_NAME] as varchar(max)) as domain_name
+        FROM [XpoMaster].[INFORMATION_SCHEMA].[COLUMNS]
+        """
+        cursor.execute(query)
+        columns = [col[0] for col in cursor.description]
+        for row in cursor:
+            yield dict(zip(columns, row))
+        cursor.close()
+
+    def finish_bundle(self):
+        if self.conn:
+            self.conn.close()
+
+
+class WriteParquetFile(beam.DoFn):
+    def __init__(self, output_path):
+        self.output_path = output_path
+        self.fs = gcsfs.GCSFileSystem()
+
+    def process(self, elements):
+        if not elements:
+            return
+
+        batch_id = uuid.uuid4().hex[:8]
+        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        output_file = os.path.join(self.output_path, f"{timestamp}_part-{batch_id}.parquet")
+
+        try:
+            table = pa.Table.from_pylist(elements)
+            with self.fs.open(output_file, 'wb') as f:
+                pq.write_table(table, f, compression='snappy')
+            logging.info(f"Wrote {len(elements)} rows to {output_file}")
+            yield output_file
+        except Exception as e:
+            logging.error(f"Failed to write Parquet: {e}")
+            raise
+
+
+def run_pipeline():
+    pipeline_options = PipelineOptions(
+        runner='DataflowRunner',
+        project='rxo-dataeng-datalake-np',
+        region='us-central1',
+        temp_location='gs://rxo-dataeng-datalake-np-dataflow/temp',
+        staging_location='gs://rxo-dataeng-datalake-np-dataflow/staging',
+        save_main_session=True,
+        service_account_email='ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com',
+        subnetwork='https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1',
+        use_public_ips=False,
+        worker_harness_container_image='us-central1-docker.pkg.dev/rxo-dataeng-datalake-np/dataflow-flex-template/info-sql-to-gcs:latest'
+    )
+    custom_options = pipeline_options.view_as(CustomPipelineOptions)
+    config = get_sql_config(custom_options.secret_id, custom_options.gcp_project)
+    connection_string = build_connection_string(config)
+
+    with beam.Pipeline(options=pipeline_options) as p:
+        (
+            p
+            | "Start" >> beam.Create([None])
+            | "Read Table" >> beam.ParDo(ReadFullTable(connection_string))
+            | "Group into one file" >> beam.combiners.ToList()
+            | "Write Parquet" >> beam.ParDo(WriteParquetFile(custom_options.output_path))
+        )
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    run_pipeline()
+
