@@ -1,0 +1,75 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+from google.cloud import storage
+import pandas as pd
+import pyarrow.parquet as pq
+import yaml
+import tempfile
+import os
+from datetime import datetime
+
+# Parámetros
+BUCKET_NAME = 'us-central1-dataeng-dl-comp-4b3fa039-bucket'
+FILE_PATH = 'data/information_schema/structure.parquet'
+OUTPUT_YAML = 'data/information_schema/sql_bronze_config.yaml'
+
+default_args = {
+    'owner': 'airflow',
+    'start_date': days_ago(1),
+}
+
+dag = DAG(
+    'generate_sql_bronze_config',
+    default_args=default_args,
+    schedule_interval=None,
+    catchup=False,
+)
+
+def process_parquet_and_generate_yaml(ds, **kwargs):
+    # ds = execution date in format '2025-07-10'
+    date_path = ds.replace("-", "/")  # e.g., '2025/07/10'
+
+    # Descargar Parquet desde GCS
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(FILE_PATH)
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+        blob.download_to_filename(tmp_file.name)
+        df = pq.read_table(tmp_file.name).to_pandas()
+
+    # Agrupar por tabla (usando TABLE_NAME y TABLE_SCHEMA)
+    config = {"tables": []}
+    grouped = df.groupby(["TABLE_SCHEMA", "TABLE_NAME"])
+    for (schema, table), group in grouped:
+        column_names = group["COLUMN_NAME"].unique().tolist()
+        if not column_names:
+            continue
+        pk_col = column_names[0]
+        table_config = {
+            "name": table.lower(),
+            "schema": schema,
+            "primary_key": pk_col,
+            "secret_id": "rxo-dataeng-datalake-np-brokerage-fo-mssql-xpomaster-uat-creds-connection-string",
+            "output_path": f"gs://rxo-dataeng-datalake-np-raw/sql/brokerage-fo/XPOMaster/{schema}/{table}/{date_path}/{table.lower()}.parquet"
+        }
+        config["tables"].append(table_config)
+
+    # Escribir YAML y subirlo a GCS
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.yaml') as tmp_yaml:
+        yaml.dump(config, tmp_yaml, sort_keys=False)
+        tmp_yaml.flush()
+        output_blob = bucket.blob(OUTPUT_YAML)
+        output_blob.upload_from_filename(tmp_yaml.name)
+
+    os.unlink(tmp_file.name)
+    os.unlink(tmp_yaml.name)
+
+generate_yaml_task = PythonOperator(
+    task_id='generate_yaml_from_parquet',
+    python_callable=process_parquet_and_generate_yaml,
+    provide_context=True,
+    op_kwargs={"ds": "{{ ds }}"},
+    dag=dag,
+)
