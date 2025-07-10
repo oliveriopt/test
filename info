@@ -1,0 +1,48 @@
+tables:
+  - name: address
+    query: "select top 100 AddressID, CityId, StateID, CountryID from locale.address"
+    secret_id: "rxo-dataeng-datalake-np-brokerage-fo-mssql-xpomaster-uat-creds-connection-string"
+    output_path: "gs://rxo-dataeng-datalake-np-raw/sql/brokerage-fo/XPOMaster/locale/Address/2025/06/30/address.parquet"
+    output_table: "rxo-dataeng-datalake-np.sqlserver_to_bq_bronze.locale_address"
+    iceberg_create_query: |
+      CREATE OR REPLACE TABLE rxo-dataeng-datalake-np.sqlserver_to_bq_silver.locale_address (
+        address_id INT64,
+        city_id INT64,
+        state_id INT64,
+        country_id INT64
+      )
+      PARTITION BY DATE(address_id)
+      WITH CONNECTION `us.iceberg-connection`
+      OPTIONS (
+        storage_format = 'ICEBERG'
+      )
+    iceberg_insert_query: |
+      INSERT INTO rxo-dataeng-datalake-np.sqlserver_to_bq_silver.locale_address
+      SELECT * FROM rxo-dataeng-datalake-np.sqlserver_to_bq_bronze.locale_address
+
+  - name: city
+    query: "select top 100 CityId, StateId, IsValidated, IsActive from locale.city"
+    secret_id: "rxo-dataeng-datalake-np-brokerage-fo-mssql-xpomaster-uat-creds-connection-string"
+    output_path: "gs://rxo-dataeng-datalake-np-raw/sql/brokerage-fo/XPOMaster/locale/City/2025/06/30/city.parquet"
+    output_table: "rxo-dataeng-datalake-np.sqlserver_to_bq_bronze.locale_city"
+    iceberg_create_query: |
+      CREATE OR REPLACE TABLE rxo-dataeng-datalake-np.sqlserver_to_bq_silver.locale_address (
+        city_id INT64,
+        state_id INT64,
+        is_validated INT64,
+        is_active INT64
+      )
+      PARTITION BY city_id
+      WITH CONNECTION `us.iceberg-connection`
+      OPTIONS (
+        storage_format = 'ICEBERG'
+      )
+    iceberg_insert_query: |
+      INSERT INTO rxo-dataeng-datalake-np.sqlserver_to_bq_silver.locale_address 
+      SELECT * FROM rxo-dataeng-datalake-np.sqlserver_to_bq_bronze.locale_city
+
+
+
+
+us-central1-dataeng-dl-comp-4b3fa039-bucket/data/information_schema
+
