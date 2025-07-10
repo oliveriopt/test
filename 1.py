@@ -108,3 +108,10 @@ with DAG(
     )
 
     run_flex_template >> generate_yaml
+
+Broken DAG (dags/dag_config_complete.py):
+Traceback (most recent call last):
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "/home/airflow/gcs/dags/dag_config_complete.py", line 3, in <module>
+    from airflow.providers.google.cloud.operators.dataflow import DataflowFlexTemplateOperator
+ImportError: cannot import name 'DataflowFlexTemplateOperator' from 'airflow.providers.google.cloud.operators.dataflow' (/opt/python3.11/lib/python3.11/site-packages/airflow/providers/google/cloud/operators/dataflow.py)
