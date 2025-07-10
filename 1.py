@@ -1,9 +1,8 @@
 gcloud dataflow flex-template run "sql-parquet-batched-job-$(date +%Y%m%d-%H%M%S)"   --template-file-gcs-location "gs://rxo-dataeng-datalake-np-dataflow/templates/sql-parquet-to-gcs-batched.json"   --region "us-central1"   --project "rxo-dataeng-datalake-np"   --service-account-email "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com"   --subnetwork "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1"   --disable-public-ips   --staging-location "gs://rxo-dataeng-datalake-np-dataflow/staging"   --temp-location "gs://rxo-dataeng-datalake-np-dataflow/temp"   --parameters "gcp_project=rxo-dataeng-datalake-np,batch_size=2000,output_path=gs://us-central1-dataeng-dl-comp-4b3fa039-bucket/data/information_schema,secret_id=rxo-dataeng-datalake-np-brokerage-fo-mssql-xpomaster-uat-creds-connection-string,num_workers=30,max_num_workers=50,autoscaling_algorithm=THROUGHPUT_BASED,machine_type=e2-highmem-4,chunk_size=100000
 
-
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.google.cloud.operators.dataflow import DataflowFlexTemplateOperator
+from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexTemplateOperator
 from airflow.utils.dates import days_ago
 from google.cloud import storage
 import pandas as pd
@@ -12,7 +11,7 @@ import yaml
 import tempfile
 import os
 
-# Configuración
+# Configuración de rutas
 BUCKET_NAME = 'us-central1-dataeng-dl-comp-4b3fa039-bucket'
 INPUT_PARQUET = 'data/information_schema/structure.parquet'
 OUTPUT_YAML = 'data/information_schema/sql_bronze_config.yaml'
@@ -31,15 +30,15 @@ with DAG(
     tags=["bronze", "dataflow", "yaml"]
 ) as dag:
 
-    # 1. Ejecutar Flex Template de Dataflow
-    run_flex_template = DataflowFlexTemplateOperator(
-        task_id="run_o_gcs_batched_flex_template",
-        project_id="rxo-dataeng-datalake-np",
-        location="us-central1",
+    # 1. Ejecutar Flex Template
+    run_flex_template = DataflowStartFlexTemplateOperator(
+        task_id='run_sql_parquet_batched_job',
+        project_id='rxo-dataeng-datalake-np',
+        region='us-central1',
         body={
             "launchParameter": {
-                "jobName": "o-gcs-batched-{{ ds_nodash }}",
-                "containerSpecGcsPath": "gs://rxo-dataeng-datalake-np-dataflow/templates/o-gcs-batched.json",
+                "jobName": "sql-parquet-batched-job-{{ ts_nodash }}",
+                "containerSpecGcsPath": "gs://rxo-dataeng-datalake-np-dataflow/templates/sql-parquet-to-gcs-batched.json",
                 "environment": {
                     "serviceAccountEmail": "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com",
                     "subnetwork": "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1",
@@ -62,7 +61,7 @@ with DAG(
         }
     )
 
-    # 2. Leer Parquet generado por Dataflow y construir YAML
+    # 2. Leer Parquet generado por el template y construir YAML
     def generate_yaml_from_parquet(ds, **kwargs):
         date_path = ds.replace("-", "/")  # e.g., 2025/07/10
 
@@ -107,10 +106,3 @@ with DAG(
     )
 
     run_flex_template >> generate_yaml
-
-Broken DAG (dags/dag_config_complete.py):
-Traceback (most recent call last):
-  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
-  File "/home/airflow/gcs/dags/dag_config_complete.py", line 3, in <module>
-    from airflow.providers.google.cloud.operators.dataflow import DataflowFlexTemplateOperator
-ImportError: cannot import name 'DataflowFlexTemplateOperator' from 'airflow.providers.google.cloud.operators.dataflow' (/opt/python3.11/lib/python3.11/site-packages/airflow/providers/google/cloud/operators/dataflow.py)
