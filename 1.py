@@ -105,3 +105,50 @@ with DAG(
 
     run_flex_template >> generate_yaml
     run_flex_template
+
+
+def generate_yaml_from_parquet(ds, **kwargs):
+    date_path = ds.replace("-", "/")  # e.g., 2025/07/10
+
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(BUCKET_NAME)
+
+    # 1. Listar archivos parquet en el folder
+    blobs = list(bucket.list_blobs(prefix=INPUT_PARQUET))
+    parquet_blobs = [b for b in blobs if b.name.endswith('.parquet')]
+
+    if not parquet_blobs:
+        raise ValueError(f"No se encontraron archivos .parquet en gs://{BUCKET_NAME}/{INPUT_PARQUET}")
+
+    # 2. Seleccionar el primero (puedes ordenar por timestamp si prefieres el más reciente)
+    selected_blob = parquet_blobs[0]
+
+    # 3. Descargar y procesar
+    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+        selected_blob.download_to_filename(tmp_file.name)
+        df = pq.read_table(tmp_file.name).to_pandas()
+
+    config = {"tables": []}
+    grouped = df.groupby(["TABLE_SCHEMA", "TABLE_NAME"])
+    for (schema, table), group in grouped:
+        column_names = group["COLUMN_NAME"].unique().tolist()
+        if not column_names:
+            continue
+        pk_col = column_names[0]
+        table_config = {
+            "name": table.lower(),
+            "schema": schema,
+            "primary_key": pk_col,
+            "secret_id": "rxo-dataeng-datalake-np-brokerage-fo-mssql-xpomaster-uat-creds-connection-string",
+            "output_path": f"gs://rxo-dataeng-datalake-np-raw/sql/brokerage-fo/XPOMaster/{schema}/{table}/{date_path}/"
+        }
+        config["tables"].append(table_config)
+
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.yaml') as tmp_yaml:
+        yaml.dump(config, tmp_yaml, sort_keys=False)
+        tmp_yaml.flush()
+        output_blob = bucket.blob(OUTPUT_YAML)
+        output_blob.upload_from_filename(tmp_yaml.name)
+
+    os.unlink(tmp_file.name)
+    os.unlink(tmp_yaml.name)
