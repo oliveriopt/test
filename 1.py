@@ -1,5 +1,3 @@
-gcloud dataflow flex-template run "sql-parquet-batched-job-$(date +%Y%m%d-%H%M%S)"   --template-file-gcs-location "gs://rxo-dataeng-datalake-np-dataflow/templates/sql-parquet-to-gcs-batched.json"   --region "us-central1"   --project "rxo-dataeng-datalake-np"   --service-account-email "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com"   --subnetwork "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1"   --disable-public-ips   --staging-location "gs://rxo-dataeng-datalake-np-dataflow/staging"   --temp-location "gs://rxo-dataeng-datalake-np-dataflow/temp"   --parameters "gcp_project=rxo-dataeng-datalake-np,batch_size=2000,output_path=gs://us-central1-dataeng-dl-comp-4b3fa039-bucket/data/information_schema,secret_id=rxo-dataeng-datalake-np-brokerage-fo-mssql-xpomaster-uat-creds-connection-string,num_workers=30,max_num_workers=50,autoscaling_algorithm=THROUGHPUT_BASED,machine_type=e2-highmem-4,chunk_size=100000
-
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexTemplateOperator
@@ -13,7 +11,7 @@ import os
 
 # Configuración de rutas
 BUCKET_NAME = 'us-central1-dataeng-dl-comp-4b3fa039-bucket'
-INPUT_PARQUET = 'data/information_schema/structure.parquet'
+INPUT_PARQUET = 'data/information_schema/'
 OUTPUT_YAML = 'data/information_schema/sql_bronze_config.yaml'
 
 default_args = {
@@ -22,7 +20,7 @@ default_args = {
 }
 
 with DAG(
-    dag_id='bronze_flex_then_generate_yaml',
+    dag_id='bronze_flex_then_generate_yaml_1',
     default_args=default_args,
     start_date=days_ago(1),
     schedule_interval=None,
@@ -34,10 +32,10 @@ with DAG(
     run_flex_template = DataflowStartFlexTemplateOperator(
         task_id='run_sql_parquet_batched_job',
         project_id='rxo-dataeng-datalake-np',
-        region='us-central1',
+        location='us-central1',
         body={
             "launchParameter": {
-                "jobName": "sql-parquet-batched-job-{{ ts_nodash }}",
+                "jobName": "sql-parquet-batched-job",
                 "containerSpecGcsPath": "gs://rxo-dataeng-datalake-np-dataflow/templates/sql-parquet-to-gcs-batched.json",
                 "environment": {
                     "serviceAccountEmail": "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com",
@@ -106,3 +104,4 @@ with DAG(
     )
 
     run_flex_template >> generate_yaml
+    run_flex_template
