@@ -130,6 +130,8 @@ with DAG(
         python_callable=list_secrets,
     )
 
+
+https://teams.microsoft.com/l/meetup-join/19%253ameeting_Y2RkNjExZTgtN2U5Ni00NmIwLWI0OTUtMTY5NWE2YWM4YjAw%2540thread.v2/0?context=%257b%2522Tid%2522%253a%25227d0a4226-a0b0-47b3-b735-b2dcdd957579%2522%252c%2522Oid%2522%253a%25221383073a-1ad0-4802-9983-82c976781290%2522%257d
     query_sql_task = PythonOperator(
         task_id="query_sql_server",
         python_callable=connect_to_sql_and_query,
