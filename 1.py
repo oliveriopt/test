@@ -12,7 +12,7 @@ PROJECT_ID = "rxo-dataeng-datalake-np"
 BQ_METADATA_TABLE = "rxo-dataeng-datalake-np.dataops_admin.table_extraction_metadata"
 
 # --- Helper: Fetch metadata from BigQuery ---
-def get_metadata_from_bq(table, database_name, schema_name):
+def get_metadata_from_bq(table_name, database_name, schema_name):
     """
     Retrieve metadata from BigQuery table for the given:
     - table (logical name)
@@ -34,26 +34,26 @@ def get_metadata_from_bq(table, database_name, schema_name):
             schema_name,
             table_name
         FROM `{BQ_METADATA_TABLE}`
-        WHERE `table` = @table
+        WHERE table_name = @table_name
           AND database_name = @database_name
           AND schema_name = @schema_name
         LIMIT 1
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
-            bigquery.ScalarQueryParameter("table", "STRING", table),
+            bigquery.ScalarQueryParameter("table_name", "STRING", table_name),
             bigquery.ScalarQueryParameter("database_name", "STRING", database_name),
             bigquery.ScalarQueryParameter("schema_name", "STRING", schema_name),
         ]
     )
 
-    logging.info(f"Querying metadata for: table={table}, db={database_name}, schema={schema_name}")
+    logging.info(f"Querying metadata for: table={table_name}, db={database_name}, schema={schema_name}")
     query_job = client.query(query, job_config=job_config)
     result = query_job.result()
 
     row = next(iter(result), None)
     if row is None:
-        raise ValueError(f"No metadata found for table '{table}' in database '{database_name}', schema '{schema_name}'")
+        raise ValueError(f"No metadata found for table '{table_name}' in database '{database_name}', schema '{schema_name}'")
 
     metadata = {
         "secret_id": row["secret_id"],
@@ -90,7 +90,7 @@ def build_connection_string(config, database_name):
 
 # --- Main Task ---
 def connect_and_query_by_metadata(**kwargs):
-    table = kwargs["params"]["table"]
+    table = kwargs["params"]["table_name"]
     database_name = kwargs["params"]["database_name"]
     schema_name = kwargs["params"]["schema_name"]
 
@@ -122,7 +122,7 @@ default_args = {
 }
 
 with DAG(
-    dag_id="query_sql_by_metadata_keys",
+    dag_id="query_sql_by_metadata_keys11",
     default_args=default_args,
     start_date=days_ago(1),
     schedule_interval=None,
@@ -133,9 +133,11 @@ with DAG(
         task_id="query_sql_table",
         python_callable=connect_and_query_by_metadata,
         params={
-            "table": "target_logical_table",       # logical name (from metadata)
-            "database_name": "sales_dw",           # SQL Server DB name
-            "schema_name": "dbo",                  # SQL Server schema
+            "table_name": "Address",       # logical name (from metadata)
+            "database_name": "XpoMaster",           # SQL Server DB name
+            "schema_name": "locale",                  # SQL Server schema
         },
     )
 
+
+run_query
