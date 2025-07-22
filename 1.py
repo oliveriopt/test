@@ -1,3 +1,5 @@
+rxo-dataeng-datalake-np.dataops_admin.table_extraction_metadata
+
 
 from google.cloud import secretmanager
 
