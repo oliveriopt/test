@@ -81,5 +81,60 @@ def build_connection_string(config, database_name):
     return (
         f"DRIVER={{{config['driver']}}};"
         f"SERVER={config['server']},1433;"
-        f"
+        f"DATABASE={database_name};"
+        f"UID={config['username']};"
+        f"PWD={config['password']};"
+        f"Encrypt=yes;"
+        f"TrustServerCertificate=yes;"
+    )
 
+# --- Main task ---
+def connect_and_query_by_metadata(**kwargs):
+    table_name = kwargs["params"]["table"]
+    database_name = kwargs["params"]["database_name"]
+    schema_name = kwargs["params"]["schema_name"]
+
+    metadata = get_metadata_from_bq(table_name, database_name, schema_name)
+    secret_id = metadata["secret_id"]
+    source_table = metadata["source_table"]
+
+    config = get_sql_config(secret_id, PROJECT_ID)
+    conn_str = build_connection_string(config, database_name)
+
+    full_table = f"[{schema_name}].[{source_table}]"
+    query = f"SELECT TOP 1 * FROM {full_table}"
+
+    logging.info(f"Executing query: {query}")
+    conn = pyodbc.connect(conn_str)
+    cursor = conn.cursor()
+    cursor.execute(query)
+
+    result = cursor.fetchone()
+    logging.info(f"Query result: {result}")
+
+    cursor.close()
+    conn.close()
+
+# --- DAG definition ---
+default_args = {
+    "owner": "airflow",
+    "retries": 1,
+}
+
+with DAG(
+    dag_id="query_sql_by_metadata_keys",
+    default_args=default_args,
+    start_date=days_ago(1),
+    schedule_interval=None,
+    catchup=False,
+) as dag:
+
+    run_query = PythonOperator(
+        task_id="query_sql_table",
+        python_callable=connect_and_query_by_metadata,
+        params={
+            "table": "target_table_name",         # logical name in metadata
+            "database_name": "sales_dw",          # SQL Server database
+            "schema_name": "dbo",                 # SQL Server schema
+        },
+    )
