@@ -41,3 +41,98 @@ def run_pipeline():
     custom_options = pipeline_options.view_as(CustomPipelineOptions)
     config = get_sql_config(custom_options.secret_id, custom_options.gcp_project)
     connection_string = build_connection_string(config)
+
+
+
+import logging
+import json
+import pyodbc
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+from google.cloud import secretmanager
+
+# Config
+PROJECT_ID = "rxo-dataeng-datalake-np"
+SECRET_ID = "sqlserver-connection"  # cambia esto a uno de los listados por list_secrets_task
+
+# --- Secret Manager utilities ---
+def get_sql_config(secret_id, project_id):
+    logging.info(f"Accessing secret '{secret_id}' from project '{project_id}'")
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+    response = client.access_secret_version(request={"name": name})
+    secret_payload = response.payload.data.decode("UTF-8")
+    logging.info("Secret retrieved successfully.")
+    return json.loads(secret_payload)
+
+def build_connection_string(config):
+    logging.info("Building SQL Server connection string...")
+    return (
+        f"DRIVER={{{config['driver']}}};"
+        f"SERVER={config['server']},1433;"
+        f"DATABASE={config['database']};"
+        f"UID={config['username']};"
+        f"PWD={config['password']};"
+        f"Encrypt=yes;"
+        f"TrustServerCertificate=yes;"
+    )
+
+# --- Task 1: List all secret_ids ---
+def list_secrets(**kwargs):
+    client = secretmanager.SecretManagerServiceClient()
+    parent = f"projects/{PROJECT_ID}"
+    secret_ids = []
+
+    logging.info(f"Listing secrets for project: {PROJECT_ID}")
+    for secret in client.list_secrets(request={"parent": parent}):
+        name = secret.name.split("/")[-1]
+        logging.info(f"Found secret: {name}")
+        secret_ids.append(name)
+
+    logging.info(f"Total secrets found: {len(secret_ids)}")
+    return secret_ids
+
+# --- Task 2: Use one specific secret to connect to SQL Server ---
+def connect_to_sql_and_query(**kwargs):
+    config = get_sql_config(SECRET_ID, PROJECT_ID)
+    conn_str = build_connection_string(config)
+
+    query = "SELECT TOP 1 * FROM your_table;"  # cambia esto a lo que necesites
+
+    logging.info("Connecting to SQL Server...")
+    conn = pyodbc.connect(conn_str)
+    cursor = conn.cursor()
+    cursor.execute(query)
+
+    result = cursor.fetchone()
+    logging.info(f"Query result: {result}")
+
+    cursor.close()
+    conn.close()
+
+# --- DAG definition ---
+default_args = {
+    "owner": "airflow",
+    "retries": 1,
+}
+
+with DAG(
+    dag_id="secret_manager_with_listing",
+    default_args=default_args,
+    start_date=days_ago(1),
+    schedule_interval=None,
+    catchup=False,
+) as dag:
+
+    list_secrets_task = PythonOperator(
+        task_id="list_secrets_task",
+        python_callable=list_secrets,
+    )
+
+    query_sql_task = PythonOperator(
+        task_id="query_sql_server",
+        python_callable=connect_to_sql_and_query,
+    )
+
+    list_secrets_task >> query_sql_task
