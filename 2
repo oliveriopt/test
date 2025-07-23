@@ -1,56 +1,3 @@
-Build and schedule a daily job to extract metadata from SQL Server's INFORMATION_SCHEMA and primary key constraints. This metadata will be used to drive orchestration and schema creation in downstream processes.
-
-Acceptance Criteria
-
-Extract table name, column list, data types, primary keys
-
-Store output as Parquet in GCS and also ingest into BigQuery for analytics
-
-Ensure idempotent execution and overwrite safety
-
-Schedule job via Composer to run daily at 6 AM
-
-
-
-    SELECT cast([TABLE_CATALOG] as varchar(max)) as table_catalog,
-           cast([TABLE_SCHEMA] as varchar(max)) as table_schema,
-           cast([TABLE_NAME] as varchar(max)) as table_name,
-           cast([COLUMN_NAME] as varchar(max)) as column_name,
-           cast([ORDINAL_POSITION] as varchar(max)) as ordinal_position,
-           cast([COLUMN_DEFAULT] as varchar(max)) as column_default,
-           cast([IS_NULLABLE] as varchar(max)) as is_nullable,
-           cast([DATA_TYPE] as varchar(max)) as data_type,
-           cast([CHARACTER_MAXIMUM_LENGTH] as varchar(max)) as character_maximum_length,
-           cast([CHARACTER_OCTET_LENGTH] as varchar(max)) as character_octet_length,
-           cast([NUMERIC_PRECISION] as varchar(max)) as numeric_precision,
-           cast([NUMERIC_PRECISION_RADIX] as varchar(max)) as numeric_precision_radix,
-           cast([NUMERIC_SCALE] as varchar(max)) as numeric_scale,
-           cast([DATETIME_PRECISION] as varchar(max)) as datetime_precision,
-           cast([CHARACTER_SET_CATALOG] as varchar(max)) as character_set_catalog,
-           cast([CHARACTER_SET_SCHEMA] as varchar(max)) as character_set_schema,
-           cast([CHARACTER_SET_NAME] as varchar(max)) as character_set_name,
-           cast([COLLATION_CATALOG] as varchar(max)) as collation_catalog,
-           cast([COLLATION_SCHEMA] as varchar(max)) as collation_schema,
-           cast([COLLATION_NAME] as varchar(max)) as collation_name,
-           cast([DOMAIN_CATALOG] as varchar(max)) as domain_catalog,
-           cast([DOMAIN_SCHEMA] as varchar(max)) as domain_schema,
-           cast([DOMAIN_NAME] as varchar(max)) as domain_name
-    FROM [XpoMaster].[INFORMATION_SCHEMA].[COLUMNS]
-
-    SELECT 
-    t.TABLE_CATALOG,
-    t.TABLE_SCHEMA,
-    t.TABLE_NAME,
-    kcu.COLUMN_NAME,
-    kcu.ORDINAL_POSITION
-FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t
-JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS kcu
-    ON t.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-    AND t.TABLE_SCHEMA = kcu.TABLE_SCHEMA
-WHERE t.CONSTRAINT_TYPE = 'PRIMARY KEY'
-ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME, kcu.ORDINAL_POSITION;
-
-
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions
 import pyodbc
@@ -64,7 +11,6 @@ import os
 import uuid
 
 from google.cloud import secretmanager
-
 
 def get_sql_config(secret_id, project_id):
     logging.info(f"Accessing secret '{secret_id}' from default project context")
@@ -88,55 +34,104 @@ def build_connection_string(config):
         f"TrustServerCertificate=yes;"
     )
 
-
 class CustomPipelineOptions(PipelineOptions):
     @classmethod
     def _add_argparse_args(cls, parser):
         parser.add_argument('--gcp_project', required=True)
-        parser.add_argument('--output_path', required=True)
+        parser.add_argument('--schema', required=True)
+        parser.add_argument('--table', required=True)
+        parser.add_argument('--reload_flag', type=lambda x: x.lower() == 'true', required=True)  # bool
+        parser.add_argument('--type_of_extraction', required=True)
+        parser.add_argument('--batch_size', type=int, default=50000)
+        parser.add_argument('--output_gcs_path', required=True)
+        parser.add_argument('--query', required=True)
         parser.add_argument('--secret_id', required=True)
+        parser.add_argument('--primary_key', required=True)
+        #parser.add_argument('--num_workers', type=int, default=30)
+        #parser.add_argument('--max_num_workers', type=int, default=50)
+        #parser.add_argument('--autoscaling_algorithm', required=True)
+        #parser.add_argument('--machine_type', required=True)
+        parser.add_argument('--chunk_size', type=int, default=100000)
 
 
-class ReadFullTable(beam.DoFn):
-    def __init__(self, connection_string):
+def generate_batch_queries(schema,table, batch_size, connection_string, reload_flag, type_of_extraction, primary_key):
+    # add schema changes validation using big query table information schema (TO DO)
+    conn = pyodbc.connect(connection_string)
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT COUNT(*) FROM [{schema}].[{table}]")
+    total_rows = cursor.fetchone()[0]
+    cursor.execute(f"""
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = '{table}' AND TABLE_SCHEMA = '{schema}'
+    """)
+    columns = [row.COLUMN_NAME for row in cursor.fetchall()]
+
+    cursor.close()
+    conn.close()
+
+    if reload_flag == True: # even if type_of_extraction is full or changtracking
+    
+        select_casts = ",\n    ".join([f"cast([{col}] as nvarchar(max)) as [{col}]" for col in columns if col])
+        queries = []
+        for start in range(1, total_rows + 1, batch_size):
+            end = start + batch_size - 1
+            query = f"""
+            SELECT * FROM (
+                SELECT 
+                {select_casts},
+                ROW_NUMBER() OVER (ORDER BY {primary_key}) AS rn
+                FROM [{schema}].[{table}]
+            ) AS numbered
+            WHERE rn BETWEEN {start} AND {end}
+            """
+            queries.append(query.strip())
+        return queries
+
+    else: # when is a chage tracking case
+        if type_of_extraction == "change_tracking":
+
+            select_casts = ",\n    ".join([f"cast(base_sql_table.[{col}] as nvarchar(max)) as [{col}]" for col in columns if col])
+            query = f"""
+                    SELECT 
+                    {select_casts},
+                    c.[SYS_CHANGE_VERSION],
+                    c.[SYS_CHANGE_OPERATION],
+                    GETUTCDATE() AS Bronze_Ingestion_Date_UTC 
+                    FROM 
+                        CHANGETABLE(CHANGES [{schema}].[{table}],0) AS c 
+                    LEFT JOIN [{schema}].[{table}] AS base_sql_table
+                    ON c.{primary_key}  = base_sql_table.{primary_key};
+                """
+            queries = [query]
+            return queries
+
+        else:
+            raise ValueError("Type of extraction not suported.") #check what we can do in this imposible case (maybe just print a message)
+
+
+class StreamedChunkedReader(beam.DoFn):
+    def __init__(self, connection_string, chunk_size):
         self.connection_string = connection_string
+        self.chunk_size = chunk_size
         self.conn = None
 
     def start_bundle(self):
         self.conn = pyodbc.connect(self.connection_string)
 
-    def process(self, element):
+    def process(self, query):
         cursor = self.conn.cursor()
-        query = f"""
-        SELECT cast([TABLE_CATALOG] as varchar(max)) as table_catalog,
-               cast([TABLE_SCHEMA] as varchar(max)) as table_schema,
-               cast([TABLE_NAME] as varchar(max)) as table_name,
-               cast([COLUMN_NAME] as varchar(max)) as column_name,
-               cast([ORDINAL_POSITION] as varchar(max)) as ordinal_position,
-               cast([COLUMN_DEFAULT] as varchar(max)) as column_default,
-               cast([IS_NULLABLE] as varchar(max)) as is_nullable,
-               cast([DATA_TYPE] as varchar(max)) as data_type,
-               cast([CHARACTER_MAXIMUM_LENGTH] as varchar(max)) as character_maximum_length,
-               cast([CHARACTER_OCTET_LENGTH] as varchar(max)) as character_octet_length,
-               cast([NUMERIC_PRECISION] as varchar(max)) as numeric_precision,
-               cast([NUMERIC_PRECISION_RADIX] as varchar(max)) as numeric_precision_radix,
-               cast([NUMERIC_SCALE] as varchar(max)) as numeric_scale,
-               cast([DATETIME_PRECISION] as varchar(max)) as datetime_precision,
-               cast([CHARACTER_SET_CATALOG] as varchar(max)) as character_set_catalog,
-               cast([CHARACTER_SET_SCHEMA] as varchar(max)) as character_set_schema,
-               cast([CHARACTER_SET_NAME] as varchar(max)) as character_set_name,
-               cast([COLLATION_CATALOG] as varchar(max)) as collation_catalog,
-               cast([COLLATION_SCHEMA] as varchar(max)) as collation_schema,
-               cast([COLLATION_NAME] as varchar(max)) as collation_name,
-               cast([DOMAIN_CATALOG] as varchar(max)) as domain_catalog,
-               cast([DOMAIN_SCHEMA] as varchar(max)) as domain_schema,
-               cast([DOMAIN_NAME] as varchar(max)) as domain_name
-        FROM [XpoMaster].[INFORMATION_SCHEMA].[COLUMNS]
-        """
+        #cursor.fast_executemany = False
         cursor.execute(query)
         columns = [col[0] for col in cursor.description]
+        chunk = []
         for row in cursor:
-            yield dict(zip(columns, row))
+            chunk.append(dict(zip(columns, row)))
+            if len(chunk) >= self.chunk_size:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
         cursor.close()
 
     def finish_bundle(self):
@@ -144,9 +139,9 @@ class ReadFullTable(beam.DoFn):
             self.conn.close()
 
 
-class WriteParquetFile(beam.DoFn):
-    def __init__(self, output_path):
-        self.output_path = output_path
+class WriteParquetPerBatch(beam.DoFn):
+    def __init__(self, output_gcs_path):
+        self.output_gcs_path = output_gcs_path
         self.fs = gcsfs.GCSFileSystem()
 
     def process(self, elements):
@@ -155,7 +150,7 @@ class WriteParquetFile(beam.DoFn):
 
         batch_id = uuid.uuid4().hex[:8]
         timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-        output_file = os.path.join(self.output_path, f"{timestamp}_part-{batch_id}.parquet")
+        output_file = os.path.join(self.output_gcs_path, f"{timestamp}_part-{batch_id}.parquet")
 
         try:
             table = pa.Table.from_pylist(elements)
@@ -179,126 +174,31 @@ def run_pipeline():
         service_account_email='ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com',
         subnetwork='https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1',
         use_public_ips=False,
-        worker_harness_container_image='us-central1-docker.pkg.dev/rxo-dataeng-datalake-np/dataflow-flex-template/info-sql-to-gcs:latest'
+        worker_harness_container_image='us-central1-docker.pkg.dev/rxo-dataeng-datalake-np/dataflow-flex-template/sql-parquet-to-gcs-batched-ap:latest'
     )
     custom_options = pipeline_options.view_as(CustomPipelineOptions)
     config = get_sql_config(custom_options.secret_id, custom_options.gcp_project)
     connection_string = build_connection_string(config)
 
+    queries = generate_batch_queries(
+        schema=custom_options.schema,
+        table=custom_options.table,
+        batch_size=custom_options.batch_size,
+        connection_string=connection_string,
+        reload_flag=custom_options.reload_flag,
+        type_of_extraction=custom_options.type_of_extraction,
+        primary_key=custom_options.primary_key
+    )
+
     with beam.Pipeline(options=pipeline_options) as p:
         (
             p
-            | "Start" >> beam.Create([None])
-            | "Read Table" >> beam.ParDo(ReadFullTable(connection_string))
-            | "Group into one file" >> beam.combiners.ToList()
-            | "Write Parquet" >> beam.ParDo(WriteParquetFile(custom_options.output_path))
+            | "Create Queries" >> beam.Create(queries)
+            | "Read & Chunk SQL" >> beam.ParDo(StreamedChunkedReader(connection_string, custom_options.chunk_size))
+            | "Write Parquet" >> beam.ParDo(WriteParquetPerBatch(custom_options.output_gcs_path))
         )
 
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     run_pipeline()
-
-
-
-Oliver
-Started building schema config structure using INFORMATION_SCHEMA.COLUMNS 
-Connected to SQL Server (non-prod) for metadata extraction
-Created YAML config prototype
-Alex
-Reviewed Flex Template structure and existing YAML injection points
-Identified hardcoded SQL in the pipeline and initiated refactor
-Listed all  tables split between us for extraction from metadata and validated extract conditions
-Fuad
-Identified some tables for extraction after splitting work up with Alex and Oliver
-Set up GCS folder structures for table-wise ingestion output
-Drafted CDC-based ingestion logic for these tables
-🟨 Day 2 (Tuesday)
-Oliver
-Expanded YAML config with table types, PKs, load types
-Stored metadata snapshot in BigQuery for audit
-Extracted PK info using INFORMATION_SCHEMA.TABLE_CONSTRAINTS and KEY_COLUMN_USAGE
-Alex
-Refactored Flex Template to generate dynamic SQL from YAML
-Added error logging for missing placeholders
-Initiated test run for orders_core and orders_header tables or any 2 tables of choice
-Fuad
-Verified parallel ingestion logic on tables.
-Created dynamic path generation in GCS per table
-Synced with Alex on shared ingestion utility code
-🟧 Day 3 (Wednesday)
-Oliver
-Finalized config generation script and pushed to GCS
-Configured Composer DAG to dynamically load this config
-Successfully extracted metadata from 2 test tables
-Alex
-Completed ingestion for <some no. of tables> tables
-Added row count checks and log writebacks to BigQuery
-Completed dynamic SQL generation for partitioned tables
-Fuad
-Ingested 80% of remaining tables using Flex Template
-Logged table execution results to BigQuery
-Began work on MERGE logic for Change Tracking to Iceberg
-🟨 Day 4 (Thursday)
-Oliver
-Composer reads config and creates task group dynamically
-If yes then maybe it can be moved to Code Review
-Alex
-Validated ingestion across all orders_* tables
-Created partitioned Iceberg tables in BigQuery
-Began documenting SQL logic translation workflow
-Fuad
-Created MERGE logic that applies I/U/D flags from change tracking
-Tested against sample data in BigLake Iceberg table
-Integrated merge step post-ingestion in Composer DAG
-🟩 Day 5 (Friday)
-Oliver
-Final cleanup and validation of config and metadata scripts
-Code review comments addressed
-Stories marked as Done
-Alex
-All orders tables are successfully ingested
-Test on possibly different data ingestion scenarios
-Flex Template logic modularized
-Fuad
-Completed ingestion of all non-orders tables
-Merge logic pushed to DAG and tested with 2 CDC-enabled tables
-Validated deletes and updates 
-
-
-
-Database,Table Name
-
-XPOMaster,accounting.AccountsPayable
-
-XPOMaster,accounting.AccountsReceivable
-
-XPOMaster,accounting.ChargeAdjustment
-
-XPOMaster,accounting.FinancialStatusType
-
-XPOMaster,carrier.AccessControlType
-
-XPOMaster,CARRIER.ACCOUNTING
-
-XPOMaster,carrier.Alert
-
-XPOMaster,carrier.Carrier
-
-XPOMaster,carrier.CarrierAuditHistory
-
-XPOMaster,carrier.CarrierPortfolio
-
-XPOMaster,carrier.FOBazookaCarrierMapping
-
-XPOMaster,carrier.Metrics
-
-XPOMaster,carrier.Operation
-
-XPOMaster,customer.Customer
-
-XPOMaster,customer.Location
-
-XPOMaster,edi.OrderRequest
-
-XPOMaster,edi.StopRequest
