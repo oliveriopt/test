@@ -112,3 +112,50 @@ class QAQueryGeneratorFromColumns:
         job = self.client.load_table_from_dataframe(df, table_ref, job_config=job_config)
         job.result()
         print(f"Uploaded {len(df)} QA queries to {table_ref}")
+
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+import sys
+import os
+
+# Agregar carpeta 'utils/' al path para importar la clase
+DAGS_DIR = os.path.dirname(os.path.realpath(__file__))
+UTILS_PATH = os.path.join(DAGS_DIR, 'utils')
+sys.path.append(UTILS_PATH)
+
+# Importar la clase desde utils/
+from qa_query_generator_from_columns import QAQueryGeneratorFromColumns
+
+default_args = {
+    'owner': 'dataops',
+    'depends_on_past': False,
+    'email_on_failure': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id='generate_qa_queries_from_columns',
+    default_args=default_args,
+    description='Genera queries QA usando metadata de columnas de SQL Server',
+    schedule_interval=None,
+    start_date=datetime(2025, 7, 24),
+    catchup=False,
+    tags=['qa', 'metadata'],
+) as dag:
+
+    def run_query_generator():
+        generator = QAQueryGeneratorFromColumns(
+            project_id="rxo-dataeng-datalake-np",
+            source_table="sqlserver_to_bq_bronze.xpo_master_infromation_schema_columns",
+            output_table="dataops_admin.qa_query_plan"
+        )
+        df = generator.generate_all_queries()
+        generator.upload_to_bigquery(df)
+
+    generate_queries = PythonOperator(
+        task_id='generate_qa_queries',
+        python_callable=run_query_generator
+    )
