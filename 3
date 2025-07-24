@@ -116,3 +116,11 @@ INSERT INTO `rxo-dataeng-datalake-np.dataops_admin.qa_information_schema_dummy` 
 VALUES 
   ('ventas.clientes', '["id_cliente", "nombre", "email", "fecha_registro"]'),
   ('ventas.pedidos', '["id_pedido", "id_cliente", "producto", "fecha_pedido"]');
+
+rxo-dataeng-datalake-np.sqlserver_to_bq_bronze.xpo_master_infromation_schema_columns
+
+Row	table_catalog	table_schema	table_name	column_name	ordinal_position	column_default	is_nullable	data_type	character_maximum_length	character_octet_length	numeric_precision	numeric_precision_radix	numeric_scale	datetime_precision	character_set_catalog	character_set_schema	character_set_name	collation_catalog	collation_schema	collation_name	domain_catalog	domain_schema	domain_name
+1	XpoMaster	fo	v_ReferenceNumber_FT	OrderReferenceNumberId	1	null	NO	int	null	null	10	10	0	null	null	null	null	null	null	null	null	null	null
+2	XpoMaster	fo	v_ReferenceNumber_FT	OrderId	2	null	NO	int	null	null	10	10	0	null	null	null	null	null	null	null	null	null	null
+3	XpoMaster	fo	v_ReferenceNumber_FT	ReferenceNumber	3	null	NO	varchar	50	50	null	null	null	null	null	null	iso_1	null	null	SQL_Latin1_General_CP1_CI_AS	null	null	null
+4	XpoMaster
