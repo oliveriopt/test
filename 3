@@ -110,3 +110,9 @@ with DAG(
     )
 
     create_dummy >> generate_qa
+
+
+INSERT INTO `rxo-dataeng-datalake-np.dataops_admin.qa_information_schema_dummy` (table_name, columns_name)
+VALUES 
+  ('ventas.clientes', '["id_cliente", "nombre", "email", "fecha_registro"]'),
+  ('ventas.pedidos', '["id_pedido", "id_cliente", "producto", "fecha_pedido"]');
