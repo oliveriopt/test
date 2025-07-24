@@ -1,46 +1,109 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from datetime import datetime, timedelta
-from google.cloud import bigquery
 import pandas as pd
-import ast
+from google.cloud import bigquery
 
 
-# Reutilizamos la clase QAQueryGenerator, pero adaptamos la dummy
-class QAQueryGenerator:
-    def __init__(self, project_id: str, input_table: str, output_table: str):
+class QAQueryGeneratorFromColumns:
+    def __init__(self, project_id: str, source_table: str, output_table: str):
         self.project_id = project_id
-        self.input_table = input_table
+        self.source_table = source_table
         self.output_table = output_table
         self.client = bigquery.Client(project=project_id)
 
-    def sanitize_column(self, col: str) -> str:
+    def load_column_metadata(self) -> pd.DataFrame:
+        query = f"""
+            SELECT table_schema, table_name, column_name
+            FROM `{self.project_id}.{self.source_table}`
+        """
+        return self.client.query(query).to_dataframe()
+
+    def group_columns_by_table(self, df: pd.DataFrame) -> dict:
+        grouped = df.groupby(['table_schema', 'table_name'])['column_name'].apply(list)
+        return grouped.to_dict()
+
+    @staticmethod
+    def sanitize_column(col: str) -> str:
         return f"[{col}]"
 
-    def build_count_query(self, table_schema, table_only, table_name):
+    def build_count_query(self, schema: str, table: str, full_table: str) -> dict:
         return {
-            "table_name": table_name,
+            "table_name": full_table,
             "check_type": "count_total_rows",
-            "query_text": f"SELECT COUNT(*) AS total_rows FROM [{table_schema}].[{table_only}]",
+            "query_text": f"SELECT COUNT(*) AS total_rows FROM [{schema}].[{table}]",
             "expected_output_format": "single_row_scalar"
         }
 
-    def generate_queries_for_table(self, table_name, columns):
-        table_schema, table_only = table_name.split('.')
-        return [self.build_count_query(table_schema, table_only, table_name)]
+    def build_nulls_query(self, schema: str, table: str, full_table: str, columns: list) -> dict:
+        cols = [self.sanitize_column(c) for c in columns]
+        null_checks = ",\n    ".join(
+            f"SUM(CASE WHEN {c} IS NULL THEN 1 ELSE 0 END) AS nulls_{c[1:-1]}" for c in cols
+        )
+        return {
+            "table_name": full_table,
+            "check_type": "nulls_per_column",
+            "query_text": f"SELECT\n    {null_checks}\nFROM [{schema}].[{table}]",
+            "expected_output_format": "single_row_scalar"
+        }
 
-    def load_metadata(self) -> pd.DataFrame:
-        query = f"SELECT table_name, columns_name FROM `{self.project_id}.{self.input_table}`"
-        return self.client.query(query).to_dataframe()
+    def build_hashcheck_query(self, schema: str, table: str, full_table: str, columns: list) -> dict:
+        cols = [self.sanitize_column(c) for c in columns]
+        concat_expr = ", ".join(f"CAST({c} AS NVARCHAR(MAX))" for c in cols)
+        query = f"""
+            SELECT *, 
+            CONVERT(VARCHAR(64), HASHBYTES('SHA2_256', CONCAT_WS('|', {concat_expr})), 2) AS hashcheck 
+            FROM [{schema}].[{table}]
+        """.strip()
+        return {
+            "table_name": full_table,
+            "check_type": "hashcheck",
+            "query_text": query,
+            "expected_output_format": "row_level"
+        }
+
+    def build_value_dist_query(self, schema: str, table: str, full_table: str, column: str) -> dict:
+        col = self.sanitize_column(column)
+        query = f"""
+            SELECT {col}, COUNT(*) AS freq 
+            FROM [{schema}].[{table}]
+            GROUP BY {col}
+            ORDER BY freq DESC
+            OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
+        """.strip()
+        return {
+            "table_name": full_table,
+            "check_type": f"value_dist_{column}",
+            "query_text": query,
+            "expected_output_format": "multi_row_summary"
+        }
+
+    def build_duplicates_query(self, schema: str, table: str, full_table: str, column: str) -> dict:
+        col = self.sanitize_column(column)
+        query = f"""
+            SELECT {col}, COUNT(*) AS cnt 
+            FROM [{schema}].[{table}]
+            GROUP BY {col}
+            HAVING COUNT(*) > 1
+        """.strip()
+        return {
+            "table_name": full_table,
+            "check_type": "duplicates_primary_key",
+            "query_text": query,
+            "expected_output_format": "multi_row_summary"
+        }
 
     def generate_all_queries(self) -> pd.DataFrame:
-        df = self.load_metadata()
+        df = self.load_column_metadata()
+        grouped = self.group_columns_by_table(df)
         all_queries = []
-        for _, row in df.iterrows():
-            table = row['table_name']
-            cols = ast.literal_eval(row['columns_name'])
-            queries = self.generate_queries_for_table(table, cols)
-            all_queries.extend(queries)
+
+        for (schema, table), columns in grouped.items():
+            full_table = f"{schema}.{table}"
+            all_queries.append(self.build_count_query(schema, table, full_table))
+            all_queries.append(self.build_nulls_query(schema, table, full_table, columns))
+            all_queries.append(self.build_hashcheck_query(schema, table, full_table, columns))
+            if columns:
+                all_queries.append(self.build_value_dist_query(schema, table, full_table, columns[0]))
+                all_queries.append(self.build_duplicates_query(schema, table, full_table, columns[0]))
+
         return pd.DataFrame(all_queries)
 
     def upload_to_bigquery(self, df: pd.DataFrame):
@@ -48,79 +111,4 @@ class QAQueryGenerator:
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
         job = self.client.load_table_from_dataframe(df, table_ref, job_config=job_config)
         job.result()
-
-
-def create_dummy_metadata_table(project_id, dataset_id, table_id):
-    client = bigquery.Client(project=project_id)
-    df = pd.DataFrame({
-        "table_name": ["ventas.clientes", "ventas.pedidos"],
-        "columns_name": [
-            '["id_cliente", "nombre", "email", "fecha_registro"]',
-            '["id_pedido", "id_cliente", "producto", "fecha_pedido"]'
-        ]
-    })
-    schema = [
-        bigquery.SchemaField("table_name", "STRING"),
-        bigquery.SchemaField("columns_name", "STRING")
-    ]
-    table_ref = f"{project_id}.{dataset_id}.{table_id}"
-    job_config = bigquery.LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE")
-    client.load_table_from_dataframe(df, table_ref, job_config=job_config).result()
-
-
-default_args = {
-    'owner': 'dataops',
-    'start_date': datetime(2025, 7, 24),
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
-}
-
-with DAG(
-    dag_id='generate_qa_queries_with_dummy',
-    default_args=default_args,
-    schedule_interval=None,
-    catchup=False,
-    tags=['qa', 'testing'],
-) as dag:
-
-    def create_dummy_table():
-        create_dummy_metadata_table(
-            project_id="rxo-dataeng-datalake-np",
-            dataset_id="dataops_admin",
-            table_id="qa_information_schema_dummy"
-        )
-
-    def generate_queries_from_dummy():
-        generator = QAQueryGenerator(
-            project_id="rxo-dataeng-datalake-np",
-            input_table="dataops_admin.qa_information_schema_dummy",
-            output_table="dataops_admin.qa_query_plan"
-        )
-        df = generator.generate_all_queries()
-        generator.upload_to_bigquery(df)
-
-    create_dummy = PythonOperator(
-        task_id="create_dummy_information_schema",
-        python_callable=create_dummy_table
-    )
-
-    generate_qa = PythonOperator(
-        task_id="generate_qa_queries",
-        python_callable=generate_queries_from_dummy
-    )
-
-    create_dummy >> generate_qa
-
-
-INSERT INTO `rxo-dataeng-datalake-np.dataops_admin.qa_information_schema_dummy` (table_name, columns_name)
-VALUES 
-  ('ventas.clientes', '["id_cliente", "nombre", "email", "fecha_registro"]'),
-  ('ventas.pedidos', '["id_pedido", "id_cliente", "producto", "fecha_pedido"]');
-
-rxo-dataeng-datalake-np.sqlserver_to_bq_bronze.xpo_master_infromation_schema_columns
-
-Row	table_catalog	table_schema	table_name	column_name	ordinal_position	column_default	is_nullable	data_type	character_maximum_length	character_octet_length	numeric_precision	numeric_precision_radix	numeric_scale	datetime_precision	character_set_catalog	character_set_schema	character_set_name	collation_catalog	collation_schema	collation_name	domain_catalog	domain_schema	domain_name
-1	XpoMaster	fo	v_ReferenceNumber_FT	OrderReferenceNumberId	1	null	NO	int	null	null	10	10	0	null	null	null	null	null	null	null	null	null	null
-2	XpoMaster	fo	v_ReferenceNumber_FT	OrderId	2	null	NO	int	null	null	10	10	0	null	null	null	null	null	null	null	null	null	null
-3	XpoMaster	fo	v_ReferenceNumber_FT	ReferenceNumber	3	null	NO	varchar	50	50	null	null	null	null	null	null	iso_1	null	null	SQL_Latin1_General_CP1_CI_AS	null	null	null
-4	XpoMaster
+        print(f"Uploaded {len(df)} QA queries to {table_ref}")
