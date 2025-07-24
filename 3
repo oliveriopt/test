@@ -1,6 +1,112 @@
-CREATE TABLE `dataops_admin.qa_query_plan` (
-  table_name STRING,
-  check_type STRING,
-  query_text STRING,
-  expected_output_format STRING
-);
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+from google.cloud import bigquery
+import pandas as pd
+import ast
+
+
+# Reutilizamos la clase QAQueryGenerator, pero adaptamos la dummy
+class QAQueryGenerator:
+    def __init__(self, project_id: str, input_table: str, output_table: str):
+        self.project_id = project_id
+        self.input_table = input_table
+        self.output_table = output_table
+        self.client = bigquery.Client(project=project_id)
+
+    def sanitize_column(self, col: str) -> str:
+        return f"[{col}]"
+
+    def build_count_query(self, table_schema, table_only, table_name):
+        return {
+            "table_name": table_name,
+            "check_type": "count_total_rows",
+            "query_text": f"SELECT COUNT(*) AS total_rows FROM [{table_schema}].[{table_only}]",
+            "expected_output_format": "single_row_scalar"
+        }
+
+    def generate_queries_for_table(self, table_name, columns):
+        table_schema, table_only = table_name.split('.')
+        return [self.build_count_query(table_schema, table_only, table_name)]
+
+    def load_metadata(self) -> pd.DataFrame:
+        query = f"SELECT table_name, columns_name FROM `{self.project_id}.{self.input_table}`"
+        return self.client.query(query).to_dataframe()
+
+    def generate_all_queries(self) -> pd.DataFrame:
+        df = self.load_metadata()
+        all_queries = []
+        for _, row in df.iterrows():
+            table = row['table_name']
+            cols = ast.literal_eval(row['columns_name'])
+            queries = self.generate_queries_for_table(table, cols)
+            all_queries.extend(queries)
+        return pd.DataFrame(all_queries)
+
+    def upload_to_bigquery(self, df: pd.DataFrame):
+        table_ref = f"{self.project_id}.{self.output_table}"
+        job_config = bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE")
+        job = self.client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+        job.result()
+
+
+def create_dummy_metadata_table(project_id, dataset_id, table_id):
+    client = bigquery.Client(project=project_id)
+    df = pd.DataFrame({
+        "table_name": ["ventas.clientes", "ventas.pedidos"],
+        "columns_name": [
+            '["id_cliente", "nombre", "email", "fecha_registro"]',
+            '["id_pedido", "id_cliente", "producto", "fecha_pedido"]'
+        ]
+    })
+    schema = [
+        bigquery.SchemaField("table_name", "STRING"),
+        bigquery.SchemaField("columns_name", "STRING")
+    ]
+    table_ref = f"{project_id}.{dataset_id}.{table_id}"
+    job_config = bigquery.LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE")
+    client.load_table_from_dataframe(df, table_ref, job_config=job_config).result()
+
+
+default_args = {
+    'owner': 'dataops',
+    'start_date': datetime(2025, 7, 24),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id='generate_qa_queries_with_dummy',
+    default_args=default_args,
+    schedule_interval=None,
+    catchup=False,
+    tags=['qa', 'testing'],
+) as dag:
+
+    def create_dummy_table():
+        create_dummy_metadata_table(
+            project_id="rxo-dataeng-datalake-np",
+            dataset_id="dataops_admin",
+            table_id="qa_information_schema_dummy"
+        )
+
+    def generate_queries_from_dummy():
+        generator = QAQueryGenerator(
+            project_id="rxo-dataeng-datalake-np",
+            input_table="dataops_admin.qa_information_schema_dummy",
+            output_table="dataops_admin.qa_query_plan"
+        )
+        df = generator.generate_all_queries()
+        generator.upload_to_bigquery(df)
+
+    create_dummy = PythonOperator(
+        task_id="create_dummy_information_schema",
+        python_callable=create_dummy_table
+    )
+
+    generate_qa = PythonOperator(
+        task_id="generate_qa_queries",
+        python_callable=generate_queries_from_dummy
+    )
+
+    create_dummy >> generate_qa
