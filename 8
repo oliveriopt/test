@@ -1,0 +1,36 @@
+            run_sql_to_gcs = DataflowStartFlexTemplateOperator(
+                task_id=f"run_sql_to_gcs_{table['schema']}_{table['table']}_batched",
+                project_id=env_config["project_id"],
+                location=env_config["region"],
+                body={
+                    "launchParameter": {
+                        "jobName": f"sql-gcs-{table['schema']}-{table['table']}-batched",
+                        "containerSpecGcsPath": env_config["template_sql_to_gcs_batched"],
+                        "environment": {
+                            "serviceAccountEmail": env_config["dataflow_service_account"],
+                            "subnetwork": env_config["subnetwork"],
+                            "tempLocation": env_config["dataflow_temp_location"],
+                            "stagingLocation": env_config["dataflow_staging_location"],
+                            "ipConfiguration": "WORKER_IP_PRIVATE"
+                        },
+                        "parameters": {
+                            "gcp_project": env_config["project_id"],
+                            "schema": table['schema'],
+                            "table" : table['table'],
+                            "reload_flag": str(table.get("reload_flag") or "false").lower(),
+                            "type_of_extraction" : table["type_of_extraction"],
+                            "batch_size": str(table['batch_size']),
+                            "output_gcs_path": table["output_gcs_path"],
+                            "query": table["query"],
+                            "secret_id": table["secret_id"],
+                            "primary_key": ",".join(table.get("primary_key", [])),
+                            "num_workers" : str(table['num_workers']),
+                            "max_num_workers" : str(table['max_num_workers']),
+                            "autoscaling_algorithm" : "THROUGHPUT_BASED",
+                            "machine_type" : "e2-highmem-4",
+                            "chunk_size" : str(table['chunk_size'])
+                            
+                        }
+                    }
+                }
+            )
