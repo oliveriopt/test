@@ -7,3 +7,52 @@ CREATE OR REPLACE TABLE `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan` (
     query_text STRING,
     expected_output_format STRING
 )
+
+
+    def generate_all_queries(self) -> pd.DataFrame:
+        df = self.load_column_metadata()
+        grouped = df.groupby(['table_catalog', 'table_schema', 'table_name'])['column_name'].apply(list)
+        grouped = grouped.reset_index(name='columns')
+
+        all_queries = []
+
+        for _, row in grouped.iterrows():
+            catalog = row['table_catalog']
+            schema = row['table_schema']
+            table = row['table_name']
+            columns = row['columns']
+            full_table = f"{schema}.{table}"
+
+            all_queries.append({
+                **self.build_count_query(schema, table, full_table),
+                "table_catalog": catalog,
+                "table_schema": schema,
+                "table_name": table
+            })
+            all_queries.append({
+                **self.build_nulls_query(schema, table, full_table, columns),
+                "table_catalog": catalog,
+                "table_schema": schema,
+                "table_name": table
+            })
+            all_queries.append({
+                **self.build_hashcheck_query(schema, table, full_table, columns),
+                "table_catalog": catalog,
+                "table_schema": schema,
+                "table_name": table
+            })
+            if columns:
+                all_queries.append({
+                    **self.build_value_dist_query(schema, table, full_table, columns[0]),
+                    "table_catalog": catalog,
+                    "table_schema": schema,
+                    "table_name": table
+                })
+                all_queries.append({
+                    **self.build_duplicates_query(schema, table, full_table, columns[0]),
+                    "table_catalog": catalog,
+                    "table_schema": schema,
+                    "table_name": table
+                })
+
+        return pd.DataFrame(all_queries)
