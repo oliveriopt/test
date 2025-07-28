@@ -1,0 +1,9 @@
+CREATE OR REPLACE TABLE `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan` (
+    table_catalog STRING,
+    table_schema STRING,
+    table_name STRING,
+    table_name_full STRING, -- opcional, por si quieres mantener schema.name
+    check_type STRING,
+    query_text STRING,
+    expected_output_format STRING
+)
