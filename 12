@@ -1,49 +1,6 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
-import yaml
-import os
-
-default_args = {
-    "owner": "dataops",
-    "retries": 1,
-}
-
-yaml_path = os.path.join(os.path.dirname(__file__), "..", "include", "qa_config.yaml")
-
-def read_yaml_config(**kwargs):
-    with open(yaml_path, "r") as f:
-        config = yaml.safe_load(f)
-
-    table_catalog = config.get("table_catalog")
-    table_schema = config.get("table_schema")
-    table_name = config.get("table_name")
-
-    print(f"📄 YAML loaded:")
-    print(f"  table_catalog: {table_catalog}")
-    print(f"  table_schema:  {table_schema}")
-    print(f"  table_name:    {table_name}")
-
-with DAG(
-    dag_id="qa_read_yaml_config",
-    default_args=default_args,
-    description="Leer YAML con información de tabla para QA",
-    schedule_interval=None,
-    start_date=days_ago(1),
-    catchup=False,
-    tags=["qa", "config"],
-) as dag:
-
-    read_config = PythonOperator(
-        task_id="read_yaml_config",
-        python_callable=read_yaml_config,
-        provide_context=True,
-    )
-
-
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 import yaml
 import os
@@ -57,7 +14,7 @@ default_args = {
 # Ruta del archivo YAML
 yaml_path = os.path.join(os.path.dirname(__file__), "..", "include", "qa_config.yaml")
 
-# === Función 1: leer archivo YAML ===
+# === Paso 1: Leer archivo YAML ===
 def read_config_task(**kwargs):
     with open(yaml_path, "r") as f:
         config = yaml.safe_load(f)
@@ -71,7 +28,7 @@ def read_config_task(**kwargs):
 
     kwargs["ti"].xcom_push(key="config", value=config)
 
-# === Función 2: leer query desde BigQuery ===
+# === Paso 2: Consultar BigQuery ===
 def get_query_task(**kwargs):
     ti = kwargs["ti"]
     config = ti.xcom_pull(task_ids="read_config", key="config")
@@ -80,32 +37,20 @@ def get_query_task(**kwargs):
     schema = config["table_schema"]
     table = config["table_name"]
 
-    query = """
+    query_sql = f"""
         SELECT query_text
         FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
-        WHERE table_catalog = @catalog
-          AND table_schema = @schema
-          AND table_name = @table
+        WHERE table_catalog = '{catalog}'
+          AND table_schema = '{schema}'
+          AND table_name = '{table}'
         LIMIT 1
     """
 
     hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
-    job = hook.run_query(
-        sql=query,
-        location="us-central1",
-        params={
-            "catalog": catalog,
-            "schema": schema,
-            "table": table
-        },
-        param_types={
-            "catalog": "STRING",
-            "schema": "STRING",
-            "table": "STRING"
-        }
+    df = hook.get_pandas_df(
+        sql=query_sql,
+        location="us-central1"
     )
-
-    df = hook.get_pandas_df(job)
 
     if df.empty:
         raise ValueError("⚠️ No QA query found in BigQuery for this table.")
