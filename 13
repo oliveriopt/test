@@ -22,7 +22,7 @@ SUBNETWORK = "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regi
 TEMPLATE_GCS_PATH = "gs://rxo-dataeng-datalake-np-dataflow/templates/sql_to_parquet.json"
 
 # === Ruta del archivo YAML ===
-yaml_path = os.path.join(os.path.dirname(__file__), "..", "include", "qa_config.yaml")
+yaml_path = os.path.join(os.path.dirname(__file__), "include", "qa_config.yaml")
 
 # === Tarea: leer configuración del YAML ===
 def read_config_task(**kwargs):
@@ -100,7 +100,7 @@ def build_flex_body(**kwargs):
     today = datetime.utcnow()
 
     output_path = (
-        f"gs://rxo-dataeng-datalake-np-raw/{catalog}/{schema}/{table}/"
+        f"gs://rxo-dataeng-datalake-np-raw/qa/{catalog}/{schema}/{table}/"
         f"{today.year:04d}/{today.month:02d}/{today.day:02d}/"
         f"data-{uuid.uuid4().hex[:8]}.parquet"
     )
@@ -129,11 +129,12 @@ def build_flex_body(**kwargs):
 
 # === DAG ===
 with DAG(
-    dag_id="qa_flex_template_from_yaml",
+    dag_id="qa_flex_template_from_yamle",
     default_args=default_args,
     start_date=days_ago(1),
     schedule_interval=None,
     catchup=False,
+    render_template_as_native_obj=True,
     tags=["qa", "bq", "flex_template"],
 ) as dag:
 
@@ -165,7 +166,7 @@ with DAG(
         task_id="run_flex_template",
         project_id=PROJECT_ID,
         location=REGION,
-        body="{{ task_instance.xcom_pull(task_ids='prepare_flex_body', key='flex_body') }}",
+        body="{{ ti.xcom_pull(task_ids='prepare_flex_body', key='flex_body') }}",
         gcp_conn_id="google_cloud_default",
     )
 
