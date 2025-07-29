@@ -1,58 +1,41 @@
-CREATE OR REPLACE TABLE `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan` (
-    table_catalog STRING,
-    table_schema STRING,
-    table_name STRING,
-    table_name_full STRING, -- opcional, por si quieres mantener schema.name
-    check_type STRING,
-    query_text STRING,
-    expected_output_format STRING
-)
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+import yaml
+import os
 
+default_args = {
+    "owner": "dataops",
+    "retries": 1,
+}
 
-    def generate_all_queries(self) -> pd.DataFrame:
-        df = self.load_column_metadata()
-        grouped = df.groupby(['table_catalog', 'table_schema', 'table_name'])['column_name'].apply(list)
-        grouped = grouped.reset_index(name='columns')
+yaml_path = os.path.join(os.path.dirname(__file__), "..", "include", "qa_config.yaml")
 
-        all_queries = []
+def read_yaml_config(**kwargs):
+    with open(yaml_path, "r") as f:
+        config = yaml.safe_load(f)
 
-        for _, row in grouped.iterrows():
-            catalog = row['table_catalog']
-            schema = row['table_schema']
-            table = row['table_name']
-            columns = row['columns']
-            full_table = f"{schema}.{table}"
+    table_catalog = config.get("table_catalog")
+    table_schema = config.get("table_schema")
+    table_name = config.get("table_name")
 
-            all_queries.append({
-                **self.build_count_query(schema, table, full_table),
-                "table_catalog": catalog,
-                "table_schema": schema,
-                "table_name": table
-            })
-            all_queries.append({
-                **self.build_nulls_query(schema, table, full_table, columns),
-                "table_catalog": catalog,
-                "table_schema": schema,
-                "table_name": table
-            })
-            all_queries.append({
-                **self.build_hashcheck_query(schema, table, full_table, columns),
-                "table_catalog": catalog,
-                "table_schema": schema,
-                "table_name": table
-            })
-            if columns:
-                all_queries.append({
-                    **self.build_value_dist_query(schema, table, full_table, columns[0]),
-                    "table_catalog": catalog,
-                    "table_schema": schema,
-                    "table_name": table
-                })
-                all_queries.append({
-                    **self.build_duplicates_query(schema, table, full_table, columns[0]),
-                    "table_catalog": catalog,
-                    "table_schema": schema,
-                    "table_name": table
-                })
+    print(f"📄 YAML loaded:")
+    print(f"  table_catalog: {table_catalog}")
+    print(f"  table_schema:  {table_schema}")
+    print(f"  table_name:    {table_name}")
 
-        return pd.DataFrame(all_queries)
+with DAG(
+    dag_id="qa_read_yaml_config",
+    default_args=default_args,
+    description="Leer YAML con información de tabla para QA",
+    schedule_interval=None,
+    start_date=days_ago(1),
+    catchup=False,
+    tags=["qa", "config"],
+) as dag:
+
+    read_config = PythonOperator(
+        task_id="read_yaml_config",
+        python_callable=read_yaml_config,
+        provide_context=True,
+    )
