@@ -4,38 +4,32 @@ from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexT
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from airflow.utils.dates import days_ago
 from datetime import datetime
-import uuid
-import yaml
 import os
+import yaml
+import uuid
 
-# === Configuración global ===
-default_args = {
-    "owner": "dataops",
-    "retries": 1,
-}
-
-# === Parámetros para Dataflow ===
+# === Config ===
 PROJECT_ID = "rxo-dataeng-datalake-np"
 REGION = "us-central1"
 SERVICE_ACCOUNT = "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com"
 SUBNETWORK = "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1"
 TEMPLATE_GCS_PATH = "gs://rxo-dataeng-datalake-np-dataflow/templates/sql_to_parquet.json"
+TEMP_LOCATION = "gs://dataflow-staging-us-central1-387408803089/temp_files"
+STAGING_LOCATION = "gs://dataflow-staging-us-central1-387408803089/staging_area"
 
-# === Ruta del archivo YAML ===
-yaml_path = os.path.join(os.path.dirname(__file__), "include", "qa_config.yaml")
+YAML_PATH = os.path.join(os.path.dirname(__file__), "include", "qa_config.yaml")
 
-def read_config_task(**kwargs):
-    with open(yaml_path, "r") as f:
+def read_config_task():
+    with open(YAML_PATH, "r") as f:
         config = yaml.safe_load(f)
 
     required_keys = {"table_catalog", "table_schema", "table_name"}
     if not required_keys.issubset(config):
         raise ValueError(f"Missing keys in YAML config: {required_keys}")
 
-    kwargs["ti"].xcom_push(key="config", value=config)
+    return config
 
-def get_all_queries_task(**kwargs):
-    config = kwargs["ti"].xcom_pull(task_ids="read_config", key="config")
+def get_queries_from_bq(config):
     catalog = config["table_catalog"]
     schema = config["table_schema"]
     table = config["table_name"]
@@ -49,15 +43,14 @@ def get_all_queries_task(**kwargs):
     """
 
     hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
-    df = hook.get_pandas_df(sql=query, dialect="standard")
+    df = hook.get_pandas_df(sql=query, location=REGION)
 
     if df.empty:
         raise ValueError(f"No query_text found for {catalog}.{schema}.{table}")
 
-    kwargs["ti"].xcom_push(key="query_list", value=df["query_text"].tolist())
+    return df["query_text"].tolist()
 
-def get_secret_id_task(**kwargs):
-    config = kwargs["ti"].xcom_pull(task_ids="read_config", key="config")
+def get_secret_id_from_bq(config):
     catalog = config["table_catalog"]
     schema = config["table_schema"]
     table = config["table_name"]
@@ -72,20 +65,19 @@ def get_secret_id_task(**kwargs):
     """
 
     hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
-    df = hook.get_pandas_df(sql=query, dialect="standard")
+    df = hook.get_pandas_df(sql=query, location=REGION)
 
     if df.empty:
         raise ValueError(f"No secret_id found for {catalog}.{schema}.{table}")
 
-    secret_id = df["secret_id"].iloc[0]
-    kwargs["ti"].xcom_push(key="secret_id", value=secret_id)
+    return df["secret_id"].iloc[0]
 
-def build_flex_body(**kwargs):
-    query_text = kwargs["query"]
-    task_index = kwargs["task_index"]
-    ti = kwargs["ti"]
-    config = ti.xcom_pull(task_ids="read_config", key="config")
-    secret_id = ti.xcom_pull(task_ids="get_secret_id", key="secret_id")
+def build_and_run_flex(**kwargs):
+    from airflow.operators.python import get_current_context
+    context = get_current_context()
+    query_text = context["query_text"]
+    config = context["config"]
+    secret_id = context["secret_id"]
 
     catalog = config["table_catalog"]
     schema = config["table_schema"]
@@ -98,15 +90,15 @@ def build_flex_body(**kwargs):
         f"data-{uuid.uuid4().hex[:8]}.parquet"
     )
 
-    body = {
+    return {
         "launchParameter": {
-            "jobName": f"sqlserver-to-gcs-{table.lower()}-{task_index}-{today.strftime('%Y%m%d%H%M%S')}",
+            "jobName": f"sqlserver-to-gcs-{table.lower()}-{uuid.uuid4().hex[:4]}",
             "containerSpecGcsPath": TEMPLATE_GCS_PATH,
             "environment": {
                 "serviceAccountEmail": SERVICE_ACCOUNT,
                 "subnetwork": SUBNETWORK,
-                "tempLocation": "gs://dataflow-staging-us-central1-387408803089/temp_files",
-                "stagingLocation": "gs://dataflow-staging-us-central1-387408803089/staging_area",
+                "tempLocation": TEMP_LOCATION,
+                "stagingLocation": STAGING_LOCATION,
                 "ipConfiguration": "WORKER_IP_PRIVATE"
             },
             "parameters": {
@@ -117,61 +109,41 @@ def build_flex_body(**kwargs):
             }
         }
     }
-    return body
 
 with DAG(
     dag_id="dag_qa_pipeline_parallel",
-    default_args=default_args,
     start_date=days_ago(1),
     schedule_interval=None,
     catchup=False,
-    render_template_as_native_obj=True,
-    tags=["qa", "parallel", "dataflow"],
+    tags=["qa", "dataflow", "parallel"]
 ) as dag:
 
-    read_config = PythonOperator(
-        task_id="read_config",
-        python_callable=read_config_task,
-        provide_context=True,
+    def orchestrate_tasks(**kwargs):
+        config = read_config_task()
+        queries = get_queries_from_bq(config)
+        secret_id = get_secret_id_from_bq(config)
+
+        tasks = []
+        for idx, query_text in enumerate(queries):
+            task_id = f"run_flex_template_{idx}"
+
+            flex_body = build_and_run_flex(
+                config=config,
+                query_text=query_text,
+                secret_id=secret_id
+            )
+
+            run_flex = DataflowStartFlexTemplateOperator(
+                task_id=task_id,
+                project_id=PROJECT_ID,
+                location=REGION,
+                body=flex_body,
+                gcp_conn_id="google_cloud_default",
+            )
+            tasks.append(run_flex)
+        return tasks
+
+    launch_all = PythonOperator(
+        task_id="launch_all_flex_templates",
+        python_callable=orchestrate_tasks
     )
-
-    get_queries = PythonOperator(
-        task_id="get_all_queries",
-        python_callable=get_all_queries_task,
-        provide_context=True,
-    )
-
-    get_secret_id = PythonOperator(
-        task_id="get_secret_id",
-        python_callable=get_secret_id_task,
-        provide_context=True,
-    )
-
-    from airflow.utils.task_group import TaskGroup
-
-    def create_flex_tasks():
-        from airflow.operators.python import task
-
-        @task(task_id="launch_all_flex_templates")
-        def launch_all_templates(ti=None):
-            query_list = ti.xcom_pull(task_ids="get_all_queries", key="query_list")
-            secret_id = ti.xcom_pull(task_ids="get_secret_id", key="secret_id")
-            config = ti.xcom_pull(task_ids="read_config", key="config")
-
-            tasks = []
-            for i, query in enumerate(query_list):
-                body = build_flex_body(ti=ti, query=query, task_index=i)
-                task = DataflowStartFlexTemplateOperator(
-                    task_id=f"run_flex_template_{i}",
-                    project_id=PROJECT_ID,
-                    location=REGION,
-                    body=body,
-                    gcp_conn_id="google_cloud_default",
-                    dag=dag
-                )
-                tasks.append(task)
-            return tasks
-
-        return launch_all_templates()
-
-    [read_config >> get_queries, read_config >> get_secret_id] >> create_flex_tasks()
