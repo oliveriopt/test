@@ -1,119 +1,79 @@
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.decorators import task
+from airflow.utils.dates import days_ago
 from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexTemplateOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
-from airflow.utils.dates import days_ago
-from airflow.exceptions import AirflowException
 
 import yaml
 import os
-from datetime import datetime
-import uuid
 
-# === Configuración global ===
-default_args = {
-    "owner": "dataops",
-    "retries": 1,
-}
-
-# === Parámetros para Dataflow ===
+# Configuración general
 PROJECT_ID = "rxo-dataeng-datalake-np"
 REGION = "us-central1"
 SERVICE_ACCOUNT = "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com"
 SUBNETWORK = "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1"
 TEMPLATE_GCS_PATH = "gs://rxo-dataeng-datalake-np-dataflow/templates/sql_to_parquet.json"
 
-# === Ruta del archivo YAML ===
-yaml_path = os.path.join(os.path.dirname(__file__), "include", "qa_config.yaml")
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../include/qa_config.yaml")
 
-# === Tarea: leer configuración YAML ===
-def read_config_task(ti):
-    with open(yaml_path, "r") as f:
-        config = yaml.safe_load(f)
+with DAG(
+    dag_id="dag_qa_pipeline_parallel",
+    start_date=days_ago(1),
+    schedule_interval=None,
+    catchup=False,
+    tags=["qa", "parallel", "dataflow"],
+) as dag:
 
-    required_keys = {"table_catalog", "table_schema", "table_name"}
-    if not required_keys.issubset(config):
-        raise ValueError(f"Missing keys in YAML config: {required_keys}")
+    @task(task_id="read_config", multiple_outputs=True)
+    def read_config():
+        with open(CONFIG_PATH, "r") as file:
+            config = yaml.safe_load(file)
+        return {
+            "catalog": config["table_catalog"],
+            "schema": config["table_schema"],
+            "table": config["table_name"],
+        }
 
-    ti.xcom_push(key="config", value=config)
+    @task(task_id="get_secret_id")
+    def get_secret_id(catalog: str, schema: str, table: str) -> str:
+        query = f"""
+        SELECT secret_id
+        FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
+        WHERE table_catalog = '{catalog}'
+          AND table_schema = '{schema}'
+          AND table_name = '{table}'
+        LIMIT 1
+        """
+        hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
+        df = hook.get_pandas_df(query)
+        return df["secret_id"].iloc[0]
 
-# === Tarea: obtener 5 queries desde qa_query_plan ===
-def get_queries_task(ti):
-    config = ti.xcom_pull(task_ids="read_config", key="config")
-    catalog = config["table_catalog"]
-    schema = config["table_schema"]
-    table = config["table_name"]
-
-    query = f"""
+    @task(task_id="get_queries", multiple_outputs=True)
+    def get_queries(catalog: str, schema: str, table: str) -> dict:
+        query = f"""
         SELECT query_text
         FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
         WHERE table_catalog = '{catalog}'
           AND table_schema = '{schema}'
           AND table_name = '{table}'
-        ORDER BY query_text
         LIMIT 5
-    """
+        """
+        hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
+        df = hook.get_pandas_df(query)
+        return {f"query_{i}": row for i, row in enumerate(df["query_text"].tolist())}
 
-    hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
-    df = hook.get_pandas_df(query, location=REGION)
+    config = read_config()
+    secret_id = get_secret_id(config["catalog"], config["schema"], config["table"])
+    queries = get_queries(config["catalog"], config["schema"], config["table"])
 
-    if df.empty or df.shape[0] < 5:
-        raise AirflowException("Less than 5 queries found for the table.")
-
-    ti.xcom_push(key="query_texts", value=df["query_text"].tolist())
-
-# === Tarea: obtener secret_id desde table_extraction_metadata ===
-def get_secret_id_task(ti):
-    config = ti.xcom_pull(task_ids="read_config", key="config")
-    catalog = config["table_catalog"]
-    schema = config["table_schema"]
-    table = config["table_name"]
-
-    query = f"""
-        SELECT secret_id
-        FROM `rxo-dataeng-datalake-np.dataops_admin.table_extraction_metadata`
-        WHERE database_name = '{catalog}'
-          AND schema_name = '{schema}'
-          AND table_name = '{table}'
-        LIMIT 1
-    """
-
-    hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
-    df = hook.get_pandas_df(query, location=REGION)
-
-    if df.empty:
-        raise AirflowException("No secret_id found for the table.")
-
-    ti.xcom_push(key="secret_id", value=df["secret_id"].iloc[0])
-
-# === Construye los operadores para los 5 jobs Flex Template ===
-def launch_all_flex_templates(ti):
-    from airflow.models.baseoperator import chain
-
-    config = ti.xcom_pull(task_ids="read_config", key="config")
-    query_texts = ti.xcom_pull(task_ids="get_queries", key="query_texts")
-    secret_id = ti.xcom_pull(task_ids="get_secret_id", key="secret_id")
-
-    catalog = config["table_catalog"]
-    schema = config["table_schema"]
-    table = config["table_name"]
-    today = datetime.utcnow()
-
-    tasks = []
-    for i, query_text in enumerate(query_texts):
-        output_path = (
-            f"gs://rxo-dataeng-datalake-np-raw/qa/{catalog}/{schema}/{table}/"
-            f"{today.year:04d}/{today.month:02d}/{today.day:02d}/"
-            f"query_{i+1}_data-{uuid.uuid4().hex[:8]}.parquet"
-        )
-
-        task = DataflowStartFlexTemplateOperator(
-            task_id=f"run_flex_query_{i+1}",
+    for i in range(5):
+        DataflowStartFlexTemplateOperator(
+            task_id=f"run_flex_template_{i}",
             project_id=PROJECT_ID,
             location=REGION,
             body={
                 "launchParameter": {
-                    "jobName": f"sqlserver-to-gcs-{table.lower()}-q{i+1}-{today.strftime('%Y%m%d%H%M%S')}",
+                    "jobName": f"qa-flex-job-{i}",
                     "containerSpecGcsPath": TEMPLATE_GCS_PATH,
                     "environment": {
                         "serviceAccountEmail": SERVICE_ACCOUNT,
@@ -123,50 +83,12 @@ def launch_all_flex_templates(ti):
                         "ipConfiguration": "WORKER_IP_PRIVATE",
                     },
                     "parameters": {
-                        "query": query_text,
-                        "secret_id": secret_id,
+                        "query": f"{{{{ ti.xcom_pull(task_ids='get_queries')['query_{i}'] }}}}",
+                        "output_path": f"gs://rxo-dataeng-datalake-np-raw/qa_output/query_{i}.snappy.parquet",
                         "gcp_pr": PROJECT_ID,
-                        "output_path": output_path,
+                        "secret_id": f"{{{{ ti.xcom_pull(task_ids='get_secret_id') }}}}",
                     },
                 }
             },
             gcp_conn_id="google_cloud_default",
-            wait_until_finished=False
         )
-        tasks.append(task)
-
-    return tasks
-
-# === DAG ===
-with DAG(
-    dag_id="dag_qa_pipeline_parallel",
-    default_args=default_args,
-    start_date=days_ago(1),
-    schedule_interval=None,
-    catchup=False,
-    render_template_as_native_obj=True,
-    tags=["qa", "bq", "flex_template"],
-) as dag:
-
-    read_config = PythonOperator(
-        task_id="read_config",
-        python_callable=read_config_task,
-    )
-
-    get_queries = PythonOperator(
-        task_id="get_queries",
-        python_callable=get_queries_task,
-    )
-
-    get_secret_id = PythonOperator(
-        task_id="get_secret_id",
-        python_callable=get_secret_id_task,
-    )
-
-    from airflow.operators.python import task
-
-    @task(task_id="launch_all_flex_templates", multiple_outputs=True)
-    def orchestrate_tasks(ti=None):
-        return launch_all_flex_templates(ti=ti)
-
-    read_config >> [get_queries, get_secret_id] >> orchestrate_tasks()
