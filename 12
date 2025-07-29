@@ -39,3 +39,102 @@ with DAG(
         python_callable=read_yaml_config,
         provide_context=True,
     )
+
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+import yaml
+import os
+
+# === Configuración general ===
+default_args = {
+    "owner": "dataops",
+    "retries": 1,
+}
+
+# Ruta del archivo YAML
+yaml_path = os.path.join(os.path.dirname(__file__), "..", "include", "qa_config.yaml")
+
+# === Función 1: leer archivo YAML ===
+def read_config_task(**kwargs):
+    with open(yaml_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    required_keys = {"table_catalog", "table_schema", "table_name"}
+    if not required_keys.issubset(config):
+        raise ValueError(f"Missing required keys in YAML config: {required_keys}")
+
+    print("✅ YAML config loaded:")
+    print(config)
+
+    kwargs["ti"].xcom_push(key="config", value=config)
+
+# === Función 2: leer query desde BigQuery ===
+def get_query_task(**kwargs):
+    ti = kwargs["ti"]
+    config = ti.xcom_pull(task_ids="read_config", key="config")
+
+    catalog = config["table_catalog"]
+    schema = config["table_schema"]
+    table = config["table_name"]
+
+    query = """
+        SELECT query_text
+        FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
+        WHERE table_catalog = @catalog
+          AND table_schema = @schema
+          AND table_name = @table
+        LIMIT 1
+    """
+
+    hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
+    job = hook.run_query(
+        sql=query,
+        location="us-central1",
+        params={
+            "catalog": catalog,
+            "schema": schema,
+            "table": table
+        },
+        param_types={
+            "catalog": "STRING",
+            "schema": "STRING",
+            "table": "STRING"
+        }
+    )
+
+    df = hook.get_pandas_df(job)
+
+    if df.empty:
+        raise ValueError("⚠️ No QA query found in BigQuery for this table.")
+
+    query_text = df["query_text"].iloc[0]
+    print("📄 Query from BigQuery:")
+    print(query_text)
+
+# === DAG ===
+with DAG(
+    dag_id="qa_query_from_yaml_bq",
+    default_args=default_args,
+    description="Leer query QA desde BQ usando archivo YAML",
+    schedule_interval=None,
+    start_date=days_ago(1),
+    catchup=False,
+    tags=["qa", "bq", "config"],
+) as dag:
+
+    read_config = PythonOperator(
+        task_id="read_config",
+        python_callable=read_config_task,
+        provide_context=True,
+    )
+
+    get_query = PythonOperator(
+        task_id="get_query_from_bq",
+        python_callable=get_query_task,
+        provide_context=True,
+    )
+
+    read_config >> get_query
