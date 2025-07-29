@@ -1,87 +1,130 @@
-from airflow import DAG
-from airflow.decorators import task
-from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexTemplateOperator
+from airflow.decorators import dag, task, task_group
+from airflow.models.param import Param
 from airflow.utils.dates import days_ago
-from airflow.models.baseoperator import chain
+from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexTemplateOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.utils.task_group import TaskGroup
 from airflow.operators.empty import EmptyOperator
-from airflow.operators.python import PythonOperator
-from google.cloud import bigquery
-import json
 
-# --- Config ---
+import os
+import yaml
+from datetime import datetime
+import uuid
+
 PROJECT_ID = "rxo-dataeng-datalake-np"
-BQ_DATASET = "dataops_admin"
-TABLE_NAME = "xpomaster_information_schema"
-PIPELINE_NAME = "qa_pipeline"
 REGION = "us-central1"
-GCS_TEMPLATE_PATH = "gs://your-bucket/templates/flex_template.json"
-SECRET_MANAGER_PROJECT = "your-secret-project"
-SECRET_NAME = "your-secret-name"
+TEMPLATE_GCS_PATH = "gs://rxo-dataeng-datalake-np-dataflow/templates/sql_to_parquet.json"
+SERVICE_ACCOUNT = "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com"
+SUBNETWORK = "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1"
+STAGING_BUCKET = "gs://dataflow-staging-us-central1-387408803089"
 
-DEFAULT_ARGS = {"owner": "airflow", "start_date": days_ago(1)}
+# Ruta local relativa al DAG en Composer
+YAML_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "include", "qa_config.yaml")
 
-with DAG(
-    dag_id="dag_qa_pipeline_parallel_v4",
-    default_args=DEFAULT_ARGS,
+
+@dag(
+    dag_id="qa_flex_template_parallel_expand",
+    start_date=days_ago(1),
     schedule_interval=None,
     catchup=False,
-    description="QA pipeline that launches 5 FlexTemplates in parallel",
-) as dag:
+    tags=["qa", "expand", "dataflow"],
+)
+def dag_qa_expand():
+
+    @task
+    def read_config():
+        with open(YAML_CONFIG_PATH, "r") as f:
+            config = yaml.safe_load(f)
+        return config["qa_targets"]
+
+    @task
+    def get_query_and_secret(config: dict):
+        catalog = config["table_catalog"]
+        schema = config["table_schema"]
+        table = config["table_name"]
+
+        # Query para obtener query_text
+        query1 = f"""
+            SELECT query_text
+            FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
+            WHERE table_catalog = '{catalog}'
+              AND table_schema = '{schema}'
+              AND table_name = '{table}'
+            LIMIT 1
+        """
+
+        # Query para obtener secret_id
+        query2 = f"""
+            SELECT secret_id
+            FROM `rxo-dataeng-datalake-np.dataops_admin.table_extraction_metadata`
+            WHERE database_name = '{catalog}'
+              AND schema_name = '{schema}'
+              AND table_name = '{table}'
+            LIMIT 1
+        """
+
+        hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
+        df1 = hook.get_pandas_df(query1, location="us-central1")
+        df2 = hook.get_pandas_df(query2, location="us-central1")
+
+        if df1.empty or df2.empty:
+            raise ValueError(f"Missing query or secret for {catalog}.{schema}.{table}")
+
+        return {
+            "query_text": df1["query_text"].iloc[0],
+            "secret_id": df2["secret_id"].iloc[0],
+            "table_catalog": catalog,
+            "table_schema": schema,
+            "table_name": table
+        }
+
+    @task
+    def build_flex_body(meta: dict):
+        now = datetime.utcnow()
+        catalog = meta["table_catalog"]
+        schema = meta["table_schema"]
+        table = meta["table_name"]
+
+        output_path = (
+            f"gs://rxo-dataeng-datalake-np-raw/qa/{catalog}/{schema}/{table}/"
+            f"{now.year:04d}/{now.month:02d}/{now.day:02d}/"
+            f"data-{uuid.uuid4().hex[:8]}.parquet"
+        )
+
+        return {
+            "jobName": f"sqlserver-to-gcs-{table.lower()}-{now.strftime('%Y%m%d%H%M%S')}",
+            "containerSpecGcsPath": TEMPLATE_GCS_PATH,
+            "environment": {
+                "serviceAccountEmail": SERVICE_ACCOUNT,
+                "subnetwork": SUBNETWORK,
+                "tempLocation": f"{STAGING_BUCKET}/temp_files",
+                "stagingLocation": f"{STAGING_BUCKET}/staging_area",
+                "ipConfiguration": "WORKER_IP_PRIVATE"
+            },
+            "parameters": {
+                "query": meta["query_text"],
+                "secret_id": meta["secret_id"],
+                "gcp_pr": PROJECT_ID,
+                "output_path": output_path
+            }
+        }
 
     start = EmptyOperator(task_id="start")
-
-    @task()
-    def read_config():
-        return {"catalog": "your_catalog", "schema": "your_schema", "table": "your_table"}
-
-    @task()
-    def get_queries(config: dict):
-        client = bigquery.Client(project=PROJECT_ID)
-        query = f"""
-            SELECT query_text
-            FROM `{PROJECT_ID}.{BQ_DATASET}.qa_query_plan`
-            WHERE table_catalog = '{config['catalog']}'
-              AND table_schema = '{config['schema']}'
-              AND table_name = '{config['table']}'
-        """
-        results = client.query(query).result()
-        return [row.query_text for row in results]
-
-    @task()
-    def get_secret_id():
-        return f"projects/{SECRET_MANAGER_PROJECT}/secrets/{SECRET_NAME}/versions/latest"
-
-    config = read_config()
-    queries = get_queries(config)
-    secret_id = get_secret_id()
-
-    flex_tasks = []
-    for i in range(5):
-        task_id = f"run_flex_template_{i}"
-
-        run_flex = DataflowStartFlexTemplateOperator(
-            task_id=task_id,
-            project_id=PROJECT_ID,
-            region=REGION,
-            body={
-                "launchParameter": {
-                    "jobName": f"{PIPELINE_NAME}_{i}",
-                    "containerSpecGcsPath": GCS_TEMPLATE_PATH,
-                    "parameters": {
-                        "query": f"{{{{ ti.xcom_pull(task_ids='get_queries')[{i}] }}}}",
-                        "secret_id": "{{ ti.xcom_pull(task_ids='get_secret_id') }}"
-                    },
-                }
-            },
-            location=REGION,
-            wait_until_finished=False,
-        )
-        flex_tasks.append(run_flex)
-
-        # set upstreams explicitly
-        chain(config, queries, secret_id, run_flex)
-
     end = EmptyOperator(task_id="end")
-    start >> config
-    for t in flex_tasks:
-        t >> end
+
+    config_list = read_config()
+
+    results = get_query_and_secret.expand(config=config_list)
+    flex_bodies = build_flex_body.expand(meta=results)
+
+    run_flex = DataflowStartFlexTemplateOperator.partial(
+        task_id="run_flex_template",
+        project_id=PROJECT_ID,
+        location=REGION,
+        gcp_conn_id="google_cloud_default",
+    ).expand(body=flex_bodies)
+
+    start >> config_list >> results >> flex_bodies >> run_flex >> end
+
+
+dag_instance = dag_qa_expand()
