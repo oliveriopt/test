@@ -1,0 +1,145 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexTemplateOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.utils.dates import days_ago
+import yaml
+import os
+from datetime import datetime
+import uuid
+
+# === Configuración global ===
+default_args = {
+    "owner": "dataops",
+    "retries": 1,
+}
+
+# === Parámetros Dataflow ===
+PROJECT_ID = "rxo-dataeng-datalake-np"
+REGION = "us-central1"
+SERVICE_ACCOUNT = "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com"
+SUBNETWORK = "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1"
+TEMPLATE_GCS_PATH = "gs://rxo-dataeng-datalake-np-dataflow/templates/sql_to_parquet.json"
+
+# === Ruta YAML ===
+yaml_path = os.path.join(os.path.dirname(__file__), "include", "qa_config.yaml")
+
+def read_config_task(**kwargs):
+    with open(yaml_path, "r") as f:
+        config = yaml.safe_load(f)
+
+    for idx, item in enumerate(config.get("tables", [])[:5]):
+        kwargs["ti"].xcom_push(key=f"config_{idx}", value=item)
+
+
+def build_branch_tasks(index):
+    def get_query_text_task(**kwargs):
+        config = kwargs["ti"].xcom_pull(key=f"config_{index}")
+        catalog, schema, table = config["table_catalog"], config["table_schema"], config["table_name"]
+        query = f"""
+            SELECT query_text
+            FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
+            WHERE table_catalog = '{catalog}'
+              AND table_schema = '{schema}'
+              AND table_name = '{table}'
+            LIMIT 1
+        """
+        df = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False).get_pandas_df(query)
+        if df.empty:
+            raise ValueError(f"No query_text found for {catalog}.{schema}.{table}")
+        kwargs["ti"].xcom_push(key=f"query_text_{index}", value=df["query_text"].iloc[0])
+
+    def get_secret_id_task(**kwargs):
+        config = kwargs["ti"].xcom_pull(key=f"config_{index}")
+        catalog, schema, table = config["table_catalog"], config["table_schema"], config["table_name"]
+        query = f"""
+            SELECT secret_id
+            FROM `rxo-dataeng-datalake-np.dataops_admin.table_extraction_metadata`
+            WHERE database_name = '{catalog}'
+              AND schema_name = '{schema}'
+              AND table_name = '{table}'
+            LIMIT 1
+        """
+        df = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False).get_pandas_df(query)
+        if df.empty:
+            raise ValueError(f"No secret_id found for {catalog}.{schema}.{table}")
+        kwargs["ti"].xcom_push(key=f"secret_id_{index}", value=df["secret_id"].iloc[0])
+
+    def build_flex_body(**kwargs):
+        config = kwargs["ti"].xcom_pull(key=f"config_{index}")
+        query_text = kwargs["ti"].xcom_pull(key=f"query_text_{index}")
+        secret_id = kwargs["ti"].xcom_pull(key=f"secret_id_{index}")
+        catalog, schema, table = config["table_catalog"], config["table_schema"], config["table_name"]
+        today = datetime.utcnow()
+        output_path = (
+            f"gs://rxo-dataeng-datalake-np-raw/qa/{catalog}/{schema}/{table}/"
+            f"{today.year:04d}/{today.month:02d}/{today.day:02d}/"
+            f"data-{uuid.uuid4().hex[:8]}.parquet"
+        )
+        flex_body = {
+            "launchParameter": {
+                "jobName": f"sqlserver-to-gcs-{table.lower()}-{today.strftime('%Y%m%d%H%M%S')}",
+                "containerSpecGcsPath": TEMPLATE_GCS_PATH,
+                "environment": {
+                    "serviceAccountEmail": SERVICE_ACCOUNT,
+                    "subnetwork": SUBNETWORK,
+                    "tempLocation": "gs://dataflow-staging-us-central1-387408803089/temp_files",
+                    "stagingLocation": "gs://dataflow-staging-us-central1-387408803089/staging_area",
+                    "ipConfiguration": "WORKER_IP_PRIVATE"
+                },
+                "parameters": {
+                    "query": query_text,
+                    "secret_id": secret_id,
+                    "gcp_pr": PROJECT_ID,
+                    "output_path": output_path
+                }
+            }
+        }
+        kwargs["ti"].xcom_push(key=f"flex_body_{index}", value=flex_body)
+
+    return get_query_text_task, get_secret_id_task, build_flex_body
+
+with DAG(
+    dag_id="qa_flex_template_parallel",
+    default_args=default_args,
+    start_date=days_ago(1),
+    schedule_interval=None,
+    catchup=False,
+    render_template_as_native_obj=True,
+    tags=["qa", "parallel", "flex_template"],
+) as dag:
+
+    read_config = PythonOperator(
+        task_id="read_config",
+        python_callable=read_config_task,
+        provide_context=True,
+    )
+
+    for i in range(5):
+        query_task = PythonOperator(
+            task_id=f"get_query_text_{i}",
+            python_callable=build_branch_tasks(i)[0],
+            provide_context=True,
+        )
+
+        secret_task = PythonOperator(
+            task_id=f"get_secret_id_{i}",
+            python_callable=build_branch_tasks(i)[1],
+            provide_context=True,
+        )
+
+        build_body_task = PythonOperator(
+            task_id=f"prepare_flex_body_{i}",
+            python_callable=build_branch_tasks(i)[2],
+            provide_context=True,
+        )
+
+        run_flex = DataflowStartFlexTemplateOperator(
+            task_id=f"run_flex_template_{i}",
+            project_id=PROJECT_ID,
+            location=REGION,
+            body=f"{{{{ ti.xcom_pull(task_ids='prepare_flex_body_{i}', key='flex_body_{i}') }}}}",
+            gcp_conn_id="google_cloud_default",
+        )
+
+        read_config >> [query_task, secret_task] >> build_body_task >> run_flex
