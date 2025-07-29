@@ -1,6 +1,6 @@
 from airflow import DAG
 from airflow.utils.dates import days_ago
-from airflow.decorators import task
+from airflow.operators.python import PythonOperator
 from airflow.operators.empty import EmptyOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 
@@ -10,6 +10,61 @@ from pathlib import Path
 CONFIG_PATH = "include/config/qa_config.yaml"
 BQ_CONN_ID = "google_cloud_default"
 BQ_LOCATION = "us-central1"
+
+def read_config_task(**kwargs):
+    config_path = Path(CONFIG_PATH)
+    with open(config_path, 'r') as file:
+        config = yaml.safe_load(file)
+    tables = config["tables"]
+    kwargs['ti'].xcom_push(key='tables_config', value=tables)
+
+def get_query_text_task(**kwargs):
+    tables = kwargs['ti'].xcom_pull(key='tables_config', task_ids='read_config')
+    updated_tables = []
+
+    bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID, use_legacy_sql=False)
+
+    for table_config in tables:
+        catalog = table_config["table_catalog"]
+        schema = table_config["table_schema"]
+        table = table_config["table_name"]
+
+        query_sql = f"""
+            SELECT query_text FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
+            WHERE table_catalog = '{catalog}' AND table_schema = '{schema}' AND table_name = '{table}'
+        """
+        df = bq_hook.get_pandas_df(query_sql, location=BQ_LOCATION)
+        if df.empty:
+            raise ValueError(f"No query_text found for {catalog}.{schema}.{table}")
+
+        table_config["query"] = df["query_text"].iloc[0]
+        updated_tables.append(table_config)
+
+    kwargs['ti'].xcom_push(key='tables_with_query', value=updated_tables)
+
+def get_secret_id_task(**kwargs):
+    tables = kwargs['ti'].xcom_pull(key='tables_with_query', task_ids='get_query_text')
+    updated_tables = []
+
+    bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID, use_legacy_sql=False)
+
+    for table_config in tables:
+        catalog = table_config["table_catalog"]
+        schema = table_config["table_schema"]
+        table = table_config["table_name"]
+
+        secret_sql = f"""
+            SELECT secret_id FROM `rxo-dataeng-datalake-np.dataops_admin.table_extraction_metadata`
+            WHERE database_name = '{catalog}' AND schema_name = '{schema}' AND table_name = '{table}'
+        """
+        df = bq_hook.get_pandas_df(secret_sql, location=BQ_LOCATION)
+        if df.empty:
+            raise ValueError(f"No secret_id found for {catalog}.{schema}.{table}")
+
+        table_config["secret_id"] = df["secret_id"].iloc[0]
+        updated_tables.append(table_config)
+
+    kwargs['ti'].xcom_push(key='tables_with_secrets', value=updated_tables)
 
 with DAG(
     dag_id="qa_read_query_and_secret",
@@ -21,51 +76,22 @@ with DAG(
 
     start = EmptyOperator(task_id="start")
 
-    @task()
-    def read_config():
-        config_path = Path(CONFIG_PATH)
-        with open(config_path, 'r') as file:
-            config = yaml.safe_load(file)
-        return config["tables"]
+    read_config = PythonOperator(
+        task_id="read_config",
+        python_callable=read_config_task,
+        provide_context=True
+    )
 
-    @task()
-    def get_query_text(table_config):
-        catalog = table_config["table_catalog"]
-        schema = table_config["table_schema"]
-        table = table_config["table_name"]
+    get_query_text = PythonOperator(
+        task_id="get_query_text",
+        python_callable=get_query_text_task,
+        provide_context=True
+    )
 
-        bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID, use_legacy_sql=False)
-        query_sql = f"""
-            SELECT query_text FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
-            WHERE table_catalog = '{catalog}' AND table_schema = '{schema}' AND table_name = '{table}'
-        """
-        df = bq_hook.get_pandas_df(query_sql, location=BQ_LOCATION)
-        if df.empty:
-            raise ValueError(f"No query_text found for {catalog}.{schema}.{table}")
+    get_secret_id = PythonOperator(
+        task_id="get_secret_id",
+        python_callable=get_secret_id_task,
+        provide_context=True
+    )
 
-        table_config["query"] = df["query_text"].iloc[0]
-        return table_config
-
-    @task()
-    def get_secret_id(table_config):
-        catalog = table_config["table_catalog"]
-        schema = table_config["table_schema"]
-        table = table_config["table_name"]
-
-        bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID, use_legacy_sql=False)
-        secret_sql = f"""
-            SELECT secret_id FROM `rxo-dataeng-datalake-np.dataops_admin.table_extraction_metadata`
-            WHERE database_name = '{catalog}' AND schema_name = '{schema}' AND table_name = '{table}'
-        """
-        df = bq_hook.get_pandas_df(secret_sql, location=BQ_LOCATION)
-        if df.empty:
-            raise ValueError(f"No secret_id found for {catalog}.{schema}.{table}")
-
-        table_config["secret_id"] = df["secret_id"].iloc[0]
-        return table_config
-
-    config = read_config()
-    with_queries = config.map(get_query_text)
-    with_secrets = with_queries.map(get_secret_id)
-
-    start >> with_secrets
+    start >> read_config >> get_query_text >> get_secret_id
