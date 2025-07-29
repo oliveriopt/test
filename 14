@@ -1,130 +1,113 @@
-from airflow.decorators import dag, task, task_group
-from airflow.models.param import Param
+from airflow import DAG
 from airflow.utils.dates import days_ago
+from airflow.decorators import task, task_group
+from airflow.operators.empty import EmptyOperator
 from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexTemplateOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
-from airflow.utils.task_group import TaskGroup
-from airflow.operators.empty import EmptyOperator
 
-import os
 import yaml
+from pathlib import Path
 from datetime import datetime
 import uuid
 
 PROJECT_ID = "rxo-dataeng-datalake-np"
 REGION = "us-central1"
-TEMPLATE_GCS_PATH = "gs://rxo-dataeng-datalake-np-dataflow/templates/sql_to_parquet.json"
 SERVICE_ACCOUNT = "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com"
 SUBNETWORK = "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1"
-STAGING_BUCKET = "gs://dataflow-staging-us-central1-387408803089"
+TEMPLATE_GCS_PATH = "gs://rxo-dataeng-datalake-np-dataflow/templates/sql_to_parquet.json"
+CONFIG_PATH = "include/config/qa_config.yaml"
+BQ_CONN_ID = "google_cloud_default"
+BQ_LOCATION = "us-central1"
 
-# Ruta local relativa al DAG en Composer
-YAML_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "include", "qa_config.yaml")
-
-
-@dag(
-    dag_id="qa_flex_template_parallel_expand",
+with DAG(
+    dag_id="qa_flex_template_parallel_expand1",
     start_date=days_ago(1),
     schedule_interval=None,
     catchup=False,
-    tags=["qa", "expand", "dataflow"],
-)
-def dag_qa_expand():
-
-    @task
-    def read_config():
-        with open(YAML_CONFIG_PATH, "r") as f:
-            config = yaml.safe_load(f)
-        return config["qa_targets"]
-
-    @task
-    def get_query_and_secret(config: dict):
-        catalog = config["table_catalog"]
-        schema = config["table_schema"]
-        table = config["table_name"]
-
-        # Query para obtener query_text
-        query1 = f"""
-            SELECT query_text
-            FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
-            WHERE table_catalog = '{catalog}'
-              AND table_schema = '{schema}'
-              AND table_name = '{table}'
-            LIMIT 1
-        """
-
-        # Query para obtener secret_id
-        query2 = f"""
-            SELECT secret_id
-            FROM `rxo-dataeng-datalake-np.dataops_admin.table_extraction_metadata`
-            WHERE database_name = '{catalog}'
-              AND schema_name = '{schema}'
-              AND table_name = '{table}'
-            LIMIT 1
-        """
-
-        hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
-        df1 = hook.get_pandas_df(query1, location="us-central1")
-        df2 = hook.get_pandas_df(query2, location="us-central1")
-
-        if df1.empty or df2.empty:
-            raise ValueError(f"Missing query or secret for {catalog}.{schema}.{table}")
-
-        return {
-            "query_text": df1["query_text"].iloc[0],
-            "secret_id": df2["secret_id"].iloc[0],
-            "table_catalog": catalog,
-            "table_schema": schema,
-            "table_name": table
-        }
-
-    @task
-    def build_flex_body(meta: dict):
-        now = datetime.utcnow()
-        catalog = meta["table_catalog"]
-        schema = meta["table_schema"]
-        table = meta["table_name"]
-
-        output_path = (
-            f"gs://rxo-dataeng-datalake-np-raw/qa/{catalog}/{schema}/{table}/"
-            f"{now.year:04d}/{now.month:02d}/{now.day:02d}/"
-            f"data-{uuid.uuid4().hex[:8]}.parquet"
-        )
-
-        return {
-            "jobName": f"sqlserver-to-gcs-{table.lower()}-{now.strftime('%Y%m%d%H%M%S')}",
-            "containerSpecGcsPath": TEMPLATE_GCS_PATH,
-            "environment": {
-                "serviceAccountEmail": SERVICE_ACCOUNT,
-                "subnetwork": SUBNETWORK,
-                "tempLocation": f"{STAGING_BUCKET}/temp_files",
-                "stagingLocation": f"{STAGING_BUCKET}/staging_area",
-                "ipConfiguration": "WORKER_IP_PRIVATE"
-            },
-            "parameters": {
-                "query": meta["query_text"],
-                "secret_id": meta["secret_id"],
-                "gcp_pr": PROJECT_ID,
-                "output_path": output_path
-            }
-        }
+    tags=["qa", "parallel", "expand"]
+) as dag:
 
     start = EmptyOperator(task_id="start")
-    end = EmptyOperator(task_id="end")
 
-    config_list = read_config()
+    @task()
+    def read_config():
+        config_path = Path(CONFIG_PATH)
+        with open(config_path, 'r') as file:
+            config = yaml.safe_load(file)
+        return config["tables"]
 
-    results = get_query_and_secret.expand(config=config_list)
-    flex_bodies = build_flex_body.expand(meta=results)
+    @task()
+    def get_query_text(table_config):
+        catalog = table_config["table_catalog"]
+        schema = table_config["table_schema"]
+        table = table_config["table_name"]
 
-    run_flex = DataflowStartFlexTemplateOperator.partial(
-        task_id="run_flex_template",
-        project_id=PROJECT_ID,
-        location=REGION,
-        gcp_conn_id="google_cloud_default",
-    ).expand(body=flex_bodies)
+        bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID, use_legacy_sql=False)
+        query_sql = f"""
+            SELECT query_text FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
+            WHERE table_catalog = '{catalog}' AND table_schema = '{schema}' AND table_name = '{table}'
+        """
+        df = bq_hook.get_pandas_df(query_sql, location=BQ_LOCATION)
+        if df.empty:
+            raise ValueError(f"No query_text found for {catalog}.{schema}.{table}")
 
-    start >> config_list >> results >> flex_bodies >> run_flex >> end
+        table_config["query"] = df["query_text"].iloc[0]
+        return table_config
 
+    @task()
+    def get_secret_id(table_config):
+        catalog = table_config["table_catalog"]
+        schema = table_config["table_schema"]
+        table = table_config["table_name"]
 
-dag_instance = dag_qa_expand()
+        bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID, use_legacy_sql=False)
+        secret_sql = f"""
+            SELECT secret_id FROM `rxo-dataeng-datalake-np.dataops_admin.table_extraction_metadata`
+            WHERE database_name = '{catalog}' AND schema_name = '{schema}' AND table_name = '{table}'
+        """
+        df = bq_hook.get_pandas_df(secret_sql, location=BQ_LOCATION)
+        if df.empty:
+            raise ValueError(f"No secret_id found for {catalog}.{schema}.{table}")
+
+        table_config["secret_id"] = df["secret_id"].iloc[0]
+
+        today = datetime.utcnow()
+        table_config["output_path"] = (
+            f"gs://rxo-dataeng-datalake-np-raw/qa/{catalog}/{schema}/{table}/"
+            f"{today.year:04d}/{today.month:02d}/{today.day:02d}/"
+            f"data-{uuid.uuid4().hex[:8]}.parquet"
+        )
+        return table_config
+
+    @task_group(group_id="flex_template_group")
+    def run_all_templates(task_inputs):
+        for i, params in enumerate(task_inputs):
+            DataflowStartFlexTemplateOperator(
+                task_id=f"run_flex_template_{i}",
+                project_id=PROJECT_ID,
+                location=REGION,
+                body={
+                    "launchParameter": {
+                        "jobName": f"sqlserver-to-gcs-{params['table_name'].replace('.', '-')}-{i}",
+                        "containerSpecGcsPath": TEMPLATE_GCS_PATH,
+                        "environment": {
+                            "serviceAccountEmail": SERVICE_ACCOUNT,
+                            "subnetwork": SUBNETWORK,
+                            "tempLocation": "gs://dataflow-staging-us-central1-387408803089/temp_files",
+                            "stagingLocation": "gs://dataflow-staging-us-central1-387408803089/staging_area",
+                            "ipConfiguration": "WORKER_IP_PRIVATE"
+                        },
+                        "parameters": {
+                            "query": params["query"],
+                            "output_path": params["output_path"],
+                            "gcp_pr": PROJECT_ID,
+                            "secret_id": params["secret_id"]
+                        }
+                    }
+                }
+            )
+
+    config = read_config()
+    with_queries = config.map(get_query_text)
+    with_secrets = with_queries.map(get_secret_id)
+    start >> with_secrets >> run_all_templates(with_secrets)
