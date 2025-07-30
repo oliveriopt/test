@@ -1,0 +1,138 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.operators.dataflow import DataflowStartFlexTemplateOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.utils.dates import days_ago
+from airflow.utils.task_group import TaskGroup
+import yaml
+import os
+from datetime import datetime
+import uuid
+
+# === Configuración global ===
+default_args = {
+    "owner": "dataops",
+    "retries": 1,
+}
+
+# === Parámetros para Dataflow ===
+PROJECT_ID = "rxo-dataeng-datalake-np"
+REGION = "us-central1"
+SERVICE_ACCOUNT = "ds-dataflow-dataeng-gsa@rxo-dataeng-datalake-np.iam.gserviceaccount.com"
+SUBNETWORK = "https://www.googleapis.com/compute/v1/projects/nxo-corp-infra/regions/us-central1/subnetworks/rxo-dataeng-datalake-np-uscentral1"
+TEMPLATE_GCS_PATH = "gs://rxo-dataeng-datalake-np-dataflow/templates/sql_to_parquet.json"
+
+# === Ruta del archivo YAML ===
+yaml_path = os.path.join(os.path.dirname(__file__), "include", "qa_config1.yaml")
+
+def read_config_task(**kwargs):
+    with open(yaml_path, "r") as f:
+        config = yaml.safe_load(f)
+    kwargs["ti"].xcom_push(key="tables", value=config["tables"])
+
+def get_queries_and_secret(catalog, schema, table):
+    hook = BigQueryHook(gcp_conn_id="google_cloud_default", use_legacy_sql=False)
+    query_sql = f"""
+        SELECT query_text
+        FROM `rxo-dataeng-datalake-np.dataops_admin.qa_query_plan`
+        WHERE table_catalog = '{catalog}'
+          AND table_schema = '{schema}'
+          AND table_name = '{table}'
+        LIMIT 5
+    """
+    df_q = hook.get_pandas_df(query_sql, location="us-central1")
+    if df_q.empty:
+        raise ValueError(f"No queries found for {catalog}.{schema}.{table}")
+
+    secret_sql = f"""
+        SELECT secret_id
+        FROM `rxo-dataeng-datalake-np.dataops_admin.table_extraction_metadata`
+        WHERE database_name = '{catalog}'
+          AND schema_name = '{schema}'
+          AND table_name = LOWER('{table}')
+        LIMIT 1
+    """
+    df_s = hook.get_pandas_df(secret_sql, location="us-central1")
+    if df_s.empty:
+        raise ValueError(f"No secret_id found for {catalog}.{schema}.{table}")
+
+    secret_id = df_s["secret_id"].iloc[0]
+    return df_q["query_text"].tolist(), secret_id
+
+with DAG(
+    dag_id="qa_flex_template_parallel_5queries_v2",
+    default_args=default_args,
+    start_date=days_ago(1),
+    schedule_interval=None,
+    catchup=False,
+    render_template_as_native_obj=True,
+    tags=["qa", "bq", "flex_template"],
+) as dag:
+
+    read_config = PythonOperator(
+        task_id="read_config",
+        python_callable=read_config_task,
+        provide_context=True,
+    )
+
+    task_groups = []
+
+    def build_task_group(catalog, schema, table, queries, secret_id):
+        group_id = f"{schema}_{table}_pipeline"
+        with TaskGroup(group_id=group_id) as tg:
+            for i, query_text in enumerate(queries):
+                output_path = (
+                    f"gs://rxo-dataeng-datalake-np-raw/qa/{catalog}/{schema}/{table}/"
+                    f"{datetime.utcnow().strftime('%Y/%m/%d')}/data-{uuid.uuid4().hex[:8]}.parquet"
+                )
+
+                DataflowStartFlexTemplateOperator(
+                    task_id=f"run_flex_{schema}_{table}_q{i+1}",
+                    project_id=PROJECT_ID,
+                    location=REGION,
+                    body={
+                        "launchParameter": {
+                            "jobName": f"sqlserver-to-gcs-{table.lower()}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-q{i+1}",
+                            "containerSpecGcsPath": TEMPLATE_GCS_PATH,
+                            "environment": {
+                                "serviceAccountEmail": SERVICE_ACCOUNT,
+                                "subnetwork": SUBNETWORK,
+                                "tempLocation": "gs://dataflow-staging-us-central1-387408803089/temp_files",
+                                "stagingLocation": "gs://dataflow-staging-us-central1-387408803089/staging_area",
+                                "ipConfiguration": "WORKER_IP_PRIVATE"
+                            },
+                            "parameters": {
+                                "query": query_text,
+                                "secret_id": secret_id,
+                                "gcp_pr": PROJECT_ID,
+                                "output_path": output_path
+                            }
+                        }
+                    },
+                    gcp_conn_id="google_cloud_default",
+                )
+        return tg
+
+    from airflow.operators.dummy import DummyOperator
+    start = DummyOperator(task_id="start")
+
+    read_config >> start
+
+    from airflow.models.xcom import XCom
+    import json
+
+    # Recuperar configuración estática y construir TaskGroups en tiempo de definición del DAG
+    try:
+        with open(yaml_path, "r") as f:
+            tables_config = yaml.safe_load(f)["tables"]
+
+        for tbl in tables_config:
+            catalog = tbl["table_catalog"]
+            schema = tbl["table_schema"]
+            table = tbl["table_name"]
+            queries, secret_id = get_queries_and_secret(catalog, schema, table)
+            tg = build_task_group(catalog, schema, table, queries, secret_id)
+            start >> tg
+
+    except Exception as e:
+        raise RuntimeError(f"Error building TaskGroups at DAG definition time: {str(e)}")
