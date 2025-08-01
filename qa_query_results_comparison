@@ -1,0 +1,13 @@
+CREATE TABLE `rxo-dataeng-datalake-np.dataops_admin.qa_query_results_comparison` (
+  table_catalog STRING,
+  table_schema STRING,
+  table_name STRING,
+  check_type STRING, -- Ej: 'count_total_rows', 'nulls_per_column', etc.
+  gcs_path STRING,   -- Ruta del archivo parquet en GCS (resultado GCS)
+  query_sql STRING,  -- Query ejecutada contra SQL Server
+  gcs_result STRING, -- Resultado de GCS (puede ser JSON string o resumen)
+  sql_result STRING, -- Resultado de SQL (puede ser JSON string o resumen)
+  result STRING,     -- 'MATCH', 'MISMATCH', 'ERROR'
+  details STRING,    -- Descripción del resultado, diferencias encontradas, errores, etc.
+  qa_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
